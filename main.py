@@ -4,7 +4,7 @@ import requests
 app = FastAPI()
 
 # 페이스북 MusicGen 정식 AI가 돌아가고 있는 허깅페이스 무료 API 주소
-HUGGINGFACE_API_URL = "https://api-inference.huggingface.co/models/facebook/musicgen-small"
+HUGGINGFACE_API_URL = "https://api-inference.huggingface.co/pipeline/text-to-audio/facebook/musicgen-small"
 # 💡 만약 나중에 공식 토큰이 필요하면 헤더에 추가할 수 있도록 세팅
 HEADERS = {} 
 
