@@ -1,38 +1,48 @@
 ﻿from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+import requests
 
-app = FastAPI(title="SymphonyAI 메인 음악 생성 서버")
+app = FastAPI()
 
-# 🌐 앱에서 서버로 접근할 수 있도록 보안(CORS) 문을 활짝 열어줍니다.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 페이스북 MusicGen 정식 AI가 돌아가고 있는 허깅페이스 무료 API 주소
+HUGGINGFACE_API_URL = "https://api-inference.huggingface.co/models/facebook/musicgen-small"
+# 💡 만약 나중에 공식 토큰이 필요하면 헤더에 추가할 수 있도록 세팅
+HEADERS = {} 
 
 @app.get("/")
-def home():
-    return {"status": "running", "message": "SymphonyAI 전용 서버가 정상 작동 중입니다."}
+def read_root():
+    return {"message": "SymphonyAI 무료 가속 서버가 정상 작동 중입니다!"}
 
-# 🔥 진수님이 앱에서 5단 콤보로 쏘아 올린 요청을 받아내는 '진짜 접수창구'
 @app.get("/api/convert")
-def generate_music(
-    song: str = Query(..., description="선택된 오디오 파일명"),
-    prompt: str = Query("", description="유저가 입력한 마법 주문 (예: 브라스 풀밴드)"),
-    remove_vocal: str = Query("N", description="보컬 제거 여부"),
-    mute_melody: str = Query("N", description="주멜로디 뮤트 여부")
+def convert_music(
+    song: str = Query(..., description="변환할 곡 파일명"),
+    prompt: str = Query(..., description="AI 마법 주문 프롬프트"),
+    remove_vocal: str = Query("N", description="보컬 제거 여부 (Y/N)"),
+    mute_melody: str = Query("N", description="주멜로디 뮤트 여부 (Y/N)")
 ):
-    # 앱에서 신호가 오면 컴퓨터 검은 창(터미널)에 아래 로그가 똑똑히 찍힙니다.
     print(f"🎵 [주문 접수] 곡명: {song}")
     print(f"✍️ [마법 주문] 프롬프트: {prompt}")
-    print(f"🎤 [옵션] 보컬제거: {remove_vocal} / 주멜로디뮤트: {mute_melody}")
+    print(f"⚙️ [옵션] 보컬제거: {remove_vocal} / 주멜로디뮤트: {mute_melody}")
+
+    # 허깅페이스 AI에게 진수님이 앱에서 입력한 프롬프트 전달하기
+    payload = {"inputs": prompt}
     
-    # [여기에 Meta MusicGen 무료 AI 엔진이 들어가서 뚝딱뚱땅 음악을 연성할 예정!]
-    
-    return {
-        "status": "success",
-        "user_prompt": prompt,
-        "message": f"'{prompt}' 스타일로 오디오 변환 작업을 시작합니다!"
-    }
+    try:
+        print("🚀 [AI 연성 중] 허깅페이스 고성능 컴퓨터로 프롬프트 전송...")
+        response = requests.post(HUGGINGFACE_API_URL, headers=HEADERS, json=payload, timeout=60)
+        
+        if response.status_code == 200:
+            print("✅ [연성 완료] AI 음악 바이너리 데이터 수신 성공!")
+            # 나중에 여기에 Render 서버나 Storage에 MP3 파일로 저장하고 다운로드 링크를 넘겨주는 로컬 코드가 얹어집니다.
+            return {
+                "status": "success",
+                "message": "AI 음악 생성이 완료되었습니다.",
+                "user_prompt": prompt,
+                "preview_info": f"HuggingFace 전송 성공 (Size: {len(response.content)} bytes)"
+            }
+        else:
+            print(f"❌ [AI 에러] 허깅페이스 응답 실패: {response.status_code}")
+            return {"status": "error", "message": f"AI 엔진 응답 실패 (코드: {response.status_code})"}
+            
+    except Exception as e:
+        print(f"💥 [서버 에러] 통신 중 오류 발생: {str(e)}")
+        return {"status": "error", "message": str(e)}
