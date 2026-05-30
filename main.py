@@ -1,4 +1,5 @@
 ﻿from fastapi import FastAPI, Query, BackgroundTasks
+from fastapi.responses import RedirectResponse
 import os
 import redis
 
@@ -56,3 +57,52 @@ def download_artifact(
         "file_type": file_type,
         "download_url": f"https://symphony-ai-storage.com/exports/{song}.{file_type if 'score' not in file_type else 'pdf'}"
     }
+
+# =================================================================
+# 5. [트렌드 반영] 소셜 로그인 요청 및 링크 제공 인터페이스
+# =================================================================
+@app.get("/api/login")
+def social_login(provider: str = Query(..., description="google 또는 kakao")):
+    
+    if provider == "google":
+        # 구글 로그인 페이지로 유저를 강제 이동(Redirect) 시킵니다.
+        # ※ 실제 상용화 시에는 YOUR_GOOGLE_CLIENT_ID를 본인의 구글 콘솔 키로 교체해야 합니다.
+        google_oauth_url = (
+            "https://accounts.google.com/o/oauth2/v2/auth"
+            "?client_id=YOUR_GOOGLE_CLIENT_ID"
+            "&redirect_uri=https://symphonyai-server.onrender.com/api/login/callback/google"
+            "&response_type=code"
+            "&scope=email%20profile"
+        )
+        return RedirectResponse(url=google_oauth_url)
+        
+    elif provider == "kakao":
+        # 카카오 로그인 페이지로 유저를 강제 이동(Redirect) 시킵니다.
+        # ※ 실제 상용화 시에는 YOUR_KAKAO_REST_KEY를 본인의 카카오 개발자 키로 교체해야 합니다.
+        kakao_oauth_url = (
+            "https://kauth.kakao.com/oauth/authorize"
+            "?client_id=YOUR_KAKAO_REST_KEY"
+            "&redirect_uri=https://symphonyai-server.onrender.com/api/login/callback/kakao"
+            "&response_type=code"
+        )
+        return RedirectResponse(url=kakao_oauth_url)
+        
+    return {"status": "failed", "message": "지원하지 않는 SNS 로그인 제공업체입니다."}
+
+# =================================================================
+# 6. [트렌드 반영] SNS 인증 완료 후 콜백(Callback) 및 앱으로 복귀(딥링크)
+# =================================================================
+@app.get("/api/login/callback/{provider}")
+def oauth_callback(provider: str, code: str):
+    # [백엔드 내부 로직 영역]
+    # 여기서 원래는 구글/카카오 서버와 code를 주고받아 유저의 실제 이메일을 받아옵니다.
+    
+    # (테스트용 가상 데이터 설정)
+    test_user_id = "symphony_user_777"
+    test_email = "symphony_user@gmail.com" if provider == "google" else "kakao_user@kakao.com"
+    
+    # 🌟 핵심: 로그인이 끝나면 유저 정보를 주소 뒤에 달고 '앱 고유의 주소(딥링크)'로 튕겨줍니다.
+    # 스마트폰이 이 주소를 감지하면 웹 브라우저를 닫고 우리 앱을 강제로 다시 켭니다.
+    app_deep_link_url = f"symphonyai://login_success?user_id={test_user_id}&email={test_email}"
+    
+    return RedirectResponse(url=app_deep_link_url)
