@@ -69,7 +69,7 @@ def social_login(provider: str = Query(..., description="google 또는 kakao")):
         # ※ 실제 상용화 시에는 YOUR_GOOGLE_CLIENT_ID를 본인의 구글 콘솔 키로 교체해야 합니다.
         google_oauth_url = (
             "https://accounts.google.com/o/oauth2/v2/auth"
-            "?client_id=YOUR_GOOGLE_CLIENT_ID"
+            "?client_id=85780968680-e713urhtmn3utpcc997b7h78d3machpr.apps.googleusercontent.com"
             "&redirect_uri=https://symphonyai-server.onrender.com/api/login/callback/google"
             "&response_type=code"
             "&scope=email%20profile"
