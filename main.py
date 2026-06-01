@@ -1,9 +1,17 @@
-﻿from fastapi import FastAPI, Query, BackgroundTasks
+from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 import os
 import redis
 
 app = FastAPI()
+
+# static 폴더가 없으면 자동으로 생성해 주는 안전장치
+if not os.path.exists("static"):
+    os.makedirs("static")
+
+# ⭐️ 오디오 파일 재생 주소를 외부(코듈라 앱)로 열어주는 정적 가상 통로 설정
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # 실시간 상태 동기화 및 작업 큐를 위한 Redis 연결 (문서 7페이지 반영)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -12,6 +20,26 @@ rd = redis.from_url(REDIS_URL)
 @app.get("/")
 def read_root():
     return {"message": "SymphonyAI 전용 생산 환경 서버가 정상 가동 중입니다!"}
+
+# =================================================================
+# [신규 추가] 코듈라 앱에서 MP3 파일 업로드 시 편집실 연동 처리 API
+# =================================================================
+@app.post("/api/file/upload")
+async def upload_audio_file(file: UploadFile = File(...)):
+    # 1. 서버 내부 static 폴더에 유저가 선택한 파일 저장하기
+    file_path = f"static/{file.filename}"
+    with open(file_path, "wb+") as file_object:
+        file_object.write(file.file.read())
+        
+    # 2. 코듈라의 Player2가 실시간으로 스트리밍 재생할 수 있는 최종 웹 주소 조립
+    full_audio_url = f"https://symphonyai-server.onrender.com/{file_path}"
+    
+    # 3. 코듈라 블록의 "audio_url" 이라는 key값과 단 한 글자도 틀리지 않게 매칭하여 반환
+    return {
+        "status": "success",
+        "audio_url": full_audio_url,
+        "file_name": file.filename
+    }
 
 # 1. 메인 변환 & 전처리 인터페이스 (브라스 풀밴드, 오케스트라, 클럽 리믹스 등 프롬프트 수신)
 @app.post("/api/convert")
@@ -81,7 +109,7 @@ def social_login(provider: str = Query(..., description="google 또는 kakao")):
         # ※ 실제 상용화 시에는 YOUR_KAKAO_REST_KEY를 본인의 카카오 개발자 키로 교체해야 합니다.
         kakao_oauth_url = (
             "https://kauth.kakao.com/oauth/authorize"
-            "?client_id=180c9d0fdb51f06f99b7b97ff373830f"
+            "?client_id=180c9d0fdb51f06f99b7b97ff373830f" #
             "&redirect_uri=https://symphonyai-server.onrender.com/api/login/callback/kakao"
             "&response_type=code"
         )
