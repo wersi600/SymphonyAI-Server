@@ -81,7 +81,7 @@ def social_login(provider: str = Query(..., description="google 또는 kakao")):
         # ※ 실제 상용화 시에는 YOUR_KAKAO_REST_KEY를 본인의 카카오 개발자 키로 교체해야 합니다.
         kakao_oauth_url = (
             "https://kauth.kakao.com/oauth/authorize"
-            "?client_id=YOUR_KAKAO_REST_KEY"
+            "?client_id=180c9d0fdb51f06f99b7b97ff373830f"
             "&redirect_uri=https://symphonyai-server.onrender.com/api/login/callback/kakao"
             "&response_type=code"
         )
