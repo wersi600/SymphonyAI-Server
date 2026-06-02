@@ -22,23 +22,26 @@ def read_root():
     return {"message": "SymphonyAI 전용 생산 환경 서버가 정상 가동 중입니다!"}
 
 # =================================================================
-# [신규 추가] 코듈라 앱에서 MP3 파일 업로드 시 편집실 연동 처리 API
+# [수정 완료] 코듈라 앱에서 MP3 파일 업로드 시 편집실 연동 처리 API
 # =================================================================
 @app.post("/api/file/upload")
 async def upload_audio_file(file: UploadFile = File(...)):
-    # 1. 서버 내부 static 폴더에 유저가 선택한 파일 저장하기
-    file_path = f"static/{file.filename}"
+    # 1. 파일명에 포함된 공백을 언더바(_)로 치환하여 URL 깨짐 방지
+    clean_filename = file.filename.replace(" ", "_")
+    file_path = f"static/{clean_filename}"
+    
+    # 2. 서버 내부 static 폴더에 유저가 선택한 파일 저장하기
     with open(file_path, "wb+") as file_object:
         file_object.write(file.file.read())
         
-    # 2. 코듈라의 Player2가 실시간으로 스트리밍 재생할 수 있는 최종 웹 주소 조립
-    full_audio_url = f"https://symphonyai-server.onrender.com/{file_path}"
+    # 3. 🌟 핵심: 코듈라의 Player2가 실시간으로 재생할 수 있도록 '/static/' 가상 경로를 정확히 포함하여 주소 조립
+    full_audio_url = f"https://symphonyai-server.onrender.com/static/{clean_filename}"
     
-    # 3. 코듈라 블록의 "audio_url" 이라는 key값과 단 한 글자도 틀리지 않게 매칭하여 반환
+    # 4. 코듈라 블록의 "audio_url", "file_name" 이라는 key값과 단 한 글자도 틀리지 않게 매칭하여 반환
     return {
         "status": "success",
         "audio_url": full_audio_url,
-        "file_name": file.filename
+        "file_name": clean_filename
     }
 
 # 1. 메인 변환 & 전처리 인터페이스 (브라스 풀밴드, 오케스트라, 클럽 리믹스 등 프롬프트 수신)
