@@ -3,6 +3,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import os
 import redis
+import urllib.parse  # 🌟 한글 파일명 깨짐 방지를 위해 필수로 추가된 모듈
 
 app = FastAPI()
 
@@ -22,26 +23,30 @@ def read_root():
     return {"message": "SymphonyAI 전용 생산 환경 서버가 정상 가동 중입니다!"}
 
 # =================================================================
-# [수정 완료] 코듈라 앱에서 MP3 파일 업로드 시 편집실 연동 처리 API
+# [완전 해결] 코듈라 앱에서 MP3 파일 업로드 시 한글 복원 및 편집실 연동 API
 # =================================================================
 @app.post("/api/file/upload")
 async def upload_audio_file(file: UploadFile = File(...)):
-    # 1. 파일명에 포함된 공백을 언더바(_)로 치환하여 URL 깨짐 방지
-    clean_filename = file.filename.replace(" ", "_")
+    # 1. 🌟 스마트폰에서 인코딩되어 인식이 불가능해진 파일명을 순수 한글로 완벽히 복원(디코딩)
+    original_filename = urllib.parse.unquote(file.filename)
+    
+    # 2. 파일명에 포함된 공백을 언더바(_)로 치환하여 URL 부러짐 방지
+    clean_filename = original_filename.replace(" ", "_")
     file_path = f"static/{clean_filename}"
     
-    # 2. 서버 내부 static 폴더에 유저가 선택한 파일 저장하기
+    # 3. 서버 내부 static 폴더에 유저가 선택한 파일 저장하기
     with open(file_path, "wb+") as file_object:
         file_object.write(file.file.read())
         
-    # 3. 🌟 핵심: 코듈라의 Player2가 실시간으로 재생할 수 있도록 '/static/' 가상 경로를 정확히 포함하여 주소 조립
-    full_audio_url = f"https://symphonyai-server.onrender.com/static/{clean_filename}"
+    # 4. 코듈라의 Player2가 안전하게 재생할 수 있도록 파일명 영역을 표준 URL 인코딩 처리
+    safe_filename = urllib.parse.quote(clean_filename)
+    full_audio_url = f"https://symphonyai-server.onrender.com/static/{safe_filename}"
     
-    # 4. 코듈라 블록의 "audio_url", "file_name" 이라는 key값과 단 한 글자도 틀리지 않게 매칭하여 반환
+    # 5. 완벽하게 세팅된 코듈라 블록 키값("audio_url", "file_name")에 맞춰 정확히 반환
     return {
         "status": "success",
         "audio_url": full_audio_url,
-        "file_name": clean_filename
+        "file_name": clean_filename  # 편집실 레이블로 꽂힐 깨지지 않는 한글 이름
     }
 
 # 1. 메인 변환 & 전처리 인터페이스 (브라스 풀밴드, 오케스트라, 클럽 리믹스 등 프롬프트 수신)
