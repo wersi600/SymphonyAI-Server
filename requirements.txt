@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 requests
-redis
 python-multipart
 pydub
 imageio-ffmpeg
