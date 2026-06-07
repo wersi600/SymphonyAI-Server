@@ -5,6 +5,7 @@ import os
 import uuid
 import urllib.parse
 import time
+import requests
 import numpy as np
 from pydub import AudioSegment
 import imageio_ffmpeg
@@ -12,6 +13,8 @@ import imageio_ffmpeg
 app = FastAPI()
 
 BASE_URL = "https://symphonyai-server.onrender.com"
+HF_WORKER_URL = "https://wers600-symphonyai-audio-worker.hf.space"
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 if not os.path.exists("static"):
     os.makedirs("static")
@@ -42,8 +45,8 @@ def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
         return [0.0] * target_peaks
 
     samples = samples / max_value
-
     chunk_size = max(1, len(samples) // target_peaks)
+
     peaks = []
 
     for i in range(0, len(samples), chunk_size):
@@ -56,6 +59,52 @@ def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
     return peaks[:target_peaks]
 
 
+def call_hf_extract_midi(file_path: str):
+    headers = {}
+
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+    with open(file_path, "rb") as f:
+        files = {
+            "file": (
+                os.path.basename(file_path),
+                f,
+                "audio/mpeg"
+            )
+        }
+
+        response = requests.post(
+            f"{HF_WORKER_URL}/extract-midi",
+            headers=headers,
+            files=files,
+            timeout=300
+        )
+
+    if response.status_code != 200:
+        return {
+            "status": "failed",
+            "message": f"HF 오류 {response.status_code}: {response.text}",
+            "midi_url": "",
+            "bar_lines_ms": [],
+            "bpm": 0
+        }
+
+    data = response.json()
+
+    midi_url = data.get("midi_url", "")
+    if midi_url.startswith("/"):
+        midi_url = HF_WORKER_URL + midi_url
+
+    return {
+        "status": data.get("status", "failed"),
+        "message": data.get("message", ""),
+        "midi_url": midi_url,
+        "bar_lines_ms": data.get("bar_lines_ms", []),
+        "bpm": data.get("bpm", 0)
+    }
+
+
 def fake_bar_lines_ms(duration_ms: int, bpm: int = 120, beats_per_bar: int = 4):
     bar_ms = int((60000 / bpm) * beats_per_bar)
     return list(range(0, duration_ms + bar_ms, bar_ms))
@@ -64,7 +113,7 @@ def fake_bar_lines_ms(duration_ms: int, bpm: int = 120, beats_per_bar: int = 4):
 def analyze_job(job_id: str):
     try:
         jobs[job_id]["status"] = "processing"
-        jobs[job_id]["message"] = "오디오 분석 중입니다."
+        jobs[job_id]["message"] = "오디오 파형 분석 중입니다."
 
         file_path = jobs[job_id]["file_path"]
 
@@ -73,20 +122,28 @@ def analyze_job(job_id: str):
 
         waveform_peaks = make_waveform_peaks(file_path, target_peaks=1200)
 
-        time.sleep(1)
-
-        jobs[job_id]["status"] = "done"
-        jobs[job_id]["message"] = "분석 완료"
         jobs[job_id]["duration_ms"] = duration_ms
         jobs[job_id]["waveform_peaks"] = waveform_peaks
 
-        # 지금은 임시 마디선. 다음 단계에서 MIDI/Basic Pitch 기준으로 교체.
-        jobs[job_id]["bar_lines_ms"] = fake_bar_lines_ms(duration_ms)
+        jobs[job_id]["message"] = "MIDI 추출 중입니다."
 
-        # 다음 단계에서 실제 Demucs/Basic Pitch 결과 URL로 교체.
+        midi_result = call_hf_extract_midi(file_path)
+
+        if midi_result["status"] == "success":
+            jobs[job_id]["midi_url"] = midi_result["midi_url"]
+            jobs[job_id]["bar_lines_ms"] = midi_result["bar_lines_ms"]
+            jobs[job_id]["bpm"] = midi_result["bpm"]
+            jobs[job_id]["message"] = "분석 완료"
+        else:
+            jobs[job_id]["midi_url"] = ""
+            jobs[job_id]["bar_lines_ms"] = fake_bar_lines_ms(duration_ms)
+            jobs[job_id]["bpm"] = 120
+            jobs[job_id]["message"] = "파형 완료 / MIDI 실패: " + midi_result["message"]
+
+        jobs[job_id]["status"] = "done"
+
         jobs[job_id]["vocal_url"] = ""
         jobs[job_id]["accompaniment_url"] = ""
-        jobs[job_id]["midi_url"] = ""
         jobs[job_id]["musicxml_url"] = ""
 
     except Exception as e:
@@ -124,6 +181,7 @@ async def upload_audio_file(
         "duration_ms": 0,
         "waveform_peaks": [],
         "bar_lines_ms": [],
+        "bpm": 0,
         "vocal_url": "",
         "accompaniment_url": "",
         "midi_url": "",
@@ -160,38 +218,12 @@ def job_status(job_id: str = Query(...)):
         "duration_ms": job["duration_ms"],
         "waveform_peaks": job["waveform_peaks"],
         "bar_lines_ms": job["bar_lines_ms"],
+        "bpm": job["bpm"],
         "vocal_url": job["vocal_url"],
         "accompaniment_url": job["accompaniment_url"],
         "midi_url": job["midi_url"],
         "musicxml_url": job["musicxml_url"]
     }
-
-
-@app.get("/api/waveform")
-def get_waveform(file_name: str = Query(...)):
-    clean_filename = urllib.parse.unquote(file_name)
-    file_path = f"static/{clean_filename}"
-
-    if not os.path.exists(file_path):
-        return {
-            "status": "failed",
-            "message": "파일을 찾을 수 없습니다.",
-            "waveform_peaks": []
-        }
-
-    try:
-        peaks = make_waveform_peaks(file_path, target_peaks=1200)
-        return {
-            "status": "success",
-            "file_name": clean_filename,
-            "waveform_peaks": peaks
-        }
-    except Exception as e:
-        return {
-            "status": "failed",
-            "message": str(e),
-            "waveform_peaks": []
-        }
 
 
 @app.post("/api/convert")
