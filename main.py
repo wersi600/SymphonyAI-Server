@@ -2,20 +2,25 @@ from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import os
+import uuid
 import urllib.parse
+import time
 import numpy as np
 from pydub import AudioSegment
 import imageio_ffmpeg
 
 app = FastAPI()
 
+BASE_URL = "https://symphonyai-server.onrender.com"
+
 if not os.path.exists("static"):
     os.makedirs("static")
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# imageio-ffmpeg가 제공하는 ffmpeg 실행파일을 pydub에 연결
 AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+
+jobs = {}
 
 
 @app.get("/")
@@ -24,10 +29,6 @@ def read_root():
 
 
 def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
-    """
-    실제 오디오를 디코딩해서 사운드포지/캡컷식 파형용 피크 데이터 생성.
-    반환값: 0.0 ~ 1.0 사이의 float 리스트
-    """
     audio = AudioSegment.from_file(file_path)
     audio = audio.set_channels(1)
 
@@ -55,33 +56,114 @@ def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
     return peaks[:target_peaks]
 
 
+def fake_bar_lines_ms(duration_ms: int, bpm: int = 120, beats_per_bar: int = 4):
+    bar_ms = int((60000 / bpm) * beats_per_bar)
+    return list(range(0, duration_ms + bar_ms, bar_ms))
+
+
+def analyze_job(job_id: str):
+    try:
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["message"] = "오디오 분석 중입니다."
+
+        file_path = jobs[job_id]["file_path"]
+
+        audio = AudioSegment.from_file(file_path)
+        duration_ms = len(audio)
+
+        waveform_peaks = make_waveform_peaks(file_path, target_peaks=1200)
+
+        time.sleep(1)
+
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["message"] = "분석 완료"
+        jobs[job_id]["duration_ms"] = duration_ms
+        jobs[job_id]["waveform_peaks"] = waveform_peaks
+
+        # 지금은 임시 마디선. 다음 단계에서 MIDI/Basic Pitch 기준으로 교체.
+        jobs[job_id]["bar_lines_ms"] = fake_bar_lines_ms(duration_ms)
+
+        # 다음 단계에서 실제 Demucs/Basic Pitch 결과 URL로 교체.
+        jobs[job_id]["vocal_url"] = ""
+        jobs[job_id]["accompaniment_url"] = ""
+        jobs[job_id]["midi_url"] = ""
+        jobs[job_id]["musicxml_url"] = ""
+
+    except Exception as e:
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["message"] = str(e)
+
+
 @app.post("/api/file/upload")
-async def upload_audio_file(file: UploadFile = File(...)):
+async def upload_audio_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
     original_filename = urllib.parse.unquote(file.filename)
     clean_filename = original_filename.replace(" ", "_")
 
-    file_path = f"static/{clean_filename}"
+    job_id = str(uuid.uuid4())
+
+    safe_filename = f"{job_id}_{clean_filename}"
+    file_path = f"static/{safe_filename}"
 
     with open(file_path, "wb+") as file_object:
         file_object.write(file.file.read())
 
-    safe_filename = urllib.parse.quote(clean_filename)
-    full_audio_url = f"https://symphonyai-server.onrender.com/static/{safe_filename}"
+    safe_url_filename = urllib.parse.quote(safe_filename)
+    full_audio_url = f"{BASE_URL}/static/{safe_url_filename}"
 
-    waveform_peaks = []
-    waveform_status = "success"
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "작업 대기 중입니다.",
+        "file_name": clean_filename,
+        "stored_file_name": safe_filename,
+        "file_path": file_path,
+        "audio_url": full_audio_url,
+        "duration_ms": 0,
+        "waveform_peaks": [],
+        "bar_lines_ms": [],
+        "vocal_url": "",
+        "accompaniment_url": "",
+        "midi_url": "",
+        "musicxml_url": ""
+    }
 
-    try:
-        waveform_peaks = make_waveform_peaks(file_path, target_peaks=1200)
-    except Exception as e:
-        waveform_status = f"failed: {str(e)}"
+    background_tasks.add_task(analyze_job, job_id)
 
     return {
         "status": "success",
+        "job_id": job_id,
+        "message": "업로드 완료. 분석을 시작합니다.",
         "audio_url": full_audio_url,
-        "file_name": clean_filename,
-        "waveform_status": waveform_status,
-        "waveform_peaks": waveform_peaks
+        "file_name": clean_filename
+    }
+
+
+@app.get("/api/job/status")
+def job_status(job_id: str = Query(...)):
+    if job_id not in jobs:
+        return {
+            "status": "failed",
+            "message": "job_id를 찾을 수 없습니다."
+        }
+
+    job = jobs[job_id]
+
+    return {
+        "status": job["status"],
+        "message": job["message"],
+        "job_id": job_id,
+        "file_name": job["file_name"],
+        "audio_url": job["audio_url"],
+        "duration_ms": job["duration_ms"],
+        "waveform_peaks": job["waveform_peaks"],
+        "bar_lines_ms": job["bar_lines_ms"],
+        "vocal_url": job["vocal_url"],
+        "accompaniment_url": job["accompaniment_url"],
+        "midi_url": job["midi_url"],
+        "musicxml_url": job["musicxml_url"]
     }
 
 
@@ -120,8 +202,7 @@ def convert_music(
     end_ms: int = Query(0),
     key_change: int = Query(0),
     remove_vocal: str = Query("N"),
-    mute_melody: str = Query("N"),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    mute_melody: str = Query("N")
 ):
     return {
         "status": "processing",
@@ -133,27 +214,6 @@ def convert_music(
         "key_change": key_change,
         "remove_vocal": remove_vocal,
         "mute_melody": mute_melody
-    }
-
-
-@app.post("/api/vocal-remove")
-def vocal_remove(
-    song: str = Query(...),
-    remove_vocal: str = Query("Y"),
-    mute_melody: str = Query("N")
-):
-    return {
-        "status": "success",
-        "message": f"보컬 처리 완료 (remove_vocal={remove_vocal}, mute_melody={mute_melody})"
-    }
-
-
-@app.get("/api/sync")
-def sync_player(song: str, current_time: float):
-    return {
-        "song": song,
-        "server_sync_time": current_time,
-        "status": "synchronized"
     }
 
 
