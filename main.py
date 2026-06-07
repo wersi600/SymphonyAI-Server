@@ -2,91 +2,165 @@ from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import os
-import redis
-import urllib.parse  # 🌟 한글 파일명 깨짐 방지를 위해 필수로 추가된 모듈
+import urllib.parse
+import numpy as np
+from pydub import AudioSegment
+import imageio_ffmpeg
 
 app = FastAPI()
 
-# static 폴더가 없으면 자동으로 생성해 주는 안전장치
 if not os.path.exists("static"):
     os.makedirs("static")
 
-# ⭐️ 오디오 파일 재생 주소를 외부(코듈라 앱)로 열어주는 정적 가상 통로 설정
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# 실시간 상태 동기화 및 작업 큐를 위한 Redis 연결 (문서 7페이지 반영)
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-rd = redis.from_url(REDIS_URL)
+# imageio-ffmpeg가 제공하는 ffmpeg 실행파일을 pydub에 연결
+AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+
 
 @app.get("/")
 def read_root():
-    return {"message": "SymphonyAI 전용 생산 환경 서버가 정상 가동 중입니다!"}
+    return {"message": "SymphonyAI 서버 정상 가동 중입니다!"}
 
-# =================================================================
-# [완전 해결] 코듈라 앱에서 MP3 파일 업로드 시 한글 복원 및 편집실 연동 API
-# =================================================================
+
+def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
+    """
+    실제 오디오를 디코딩해서 사운드포지/캡컷식 파형용 피크 데이터 생성.
+    반환값: 0.0 ~ 1.0 사이의 float 리스트
+    """
+    audio = AudioSegment.from_file(file_path)
+    audio = audio.set_channels(1)
+
+    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+
+    if len(samples) == 0:
+        return []
+
+    max_value = np.max(np.abs(samples))
+    if max_value == 0:
+        return [0.0] * target_peaks
+
+    samples = samples / max_value
+
+    chunk_size = max(1, len(samples) // target_peaks)
+    peaks = []
+
+    for i in range(0, len(samples), chunk_size):
+        chunk = samples[i:i + chunk_size]
+        if len(chunk) == 0:
+            continue
+        peak = float(np.max(np.abs(chunk)))
+        peaks.append(round(peak, 4))
+
+    return peaks[:target_peaks]
+
+
 @app.post("/api/file/upload")
 async def upload_audio_file(file: UploadFile = File(...)):
-    # 1. 🌟 스마트폰에서 인코딩되어 인식이 불가능해진 파일명을 순수 한글로 완벽히 복원(디코딩)
     original_filename = urllib.parse.unquote(file.filename)
-    
-    # 2. 파일명에 포함된 공백을 언더바(_)로 치환하여 URL 부러짐 방지
     clean_filename = original_filename.replace(" ", "_")
+
     file_path = f"static/{clean_filename}"
-    
-    # 3. 서버 내부 static 폴더에 유저가 선택한 파일 저장하기
+
     with open(file_path, "wb+") as file_object:
         file_object.write(file.file.read())
-        
-    # 4. 코듈라의 Player2가 안전하게 재생할 수 있도록 파일명 영역을 표준 URL 인코딩 처리
+
     safe_filename = urllib.parse.quote(clean_filename)
     full_audio_url = f"https://symphonyai-server.onrender.com/static/{safe_filename}"
-    
-    # 5. 완벽하게 세팅된 코듈라 블록 키값("audio_url", "file_name")에 맞춰 정확히 반환
+
+    waveform_peaks = []
+    waveform_status = "success"
+
+    try:
+        waveform_peaks = make_waveform_peaks(file_path, target_peaks=1200)
+    except Exception as e:
+        waveform_status = f"failed: {str(e)}"
+
     return {
         "status": "success",
         "audio_url": full_audio_url,
-        "file_name": clean_filename  # 편집실 레이블로 꽂힐 깨지지 않는 한글 이름
+        "file_name": clean_filename,
+        "waveform_status": waveform_status,
+        "waveform_peaks": waveform_peaks
     }
 
-# 1. 메인 변환 & 전처리 인터페이스 (브라스 풀밴드, 오케스트라, 클럽 리믹스 등 프롬프트 수신)
+
+@app.get("/api/waveform")
+def get_waveform(file_name: str = Query(...)):
+    clean_filename = urllib.parse.unquote(file_name)
+    file_path = f"static/{clean_filename}"
+
+    if not os.path.exists(file_path):
+        return {
+            "status": "failed",
+            "message": "파일을 찾을 수 없습니다.",
+            "waveform_peaks": []
+        }
+
+    try:
+        peaks = make_waveform_peaks(file_path, target_peaks=1200)
+        return {
+            "status": "success",
+            "file_name": clean_filename,
+            "waveform_peaks": peaks
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "message": str(e),
+            "waveform_peaks": []
+        }
+
+
 @app.post("/api/convert")
 def convert_music(
-    song: str = Query(..., description="업로드된 MP3 파일명"),
-    prompt: str = Query(..., description="재편곡 AI 마법 주문 프롬프트"),
+    song: str = Query(...),
+    prompt: str = Query(...),
+    start_ms: int = Query(0),
+    end_ms: int = Query(0),
+    key_change: int = Query(0),
+    remove_vocal: str = Query("N"),
+    mute_melody: str = Query("N"),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
-    # TODO: Background Worker(Pro)로 무거운 AI 연산(옥타브 자동조정, 화성학 편곡)을 넘기는 큐 작업 추가
     return {
         "status": "processing",
-        "message": "AI 재편곡 및 화성학 연산 작업이 큐에 등록되었습니다.",
+        "message": "AI 재편집 작업이 큐에 등록되었습니다.",
         "song": song,
-        "prompt": prompt
+        "prompt": prompt,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "key_change": key_change,
+        "remove_vocal": remove_vocal,
+        "mute_melody": mute_melody
     }
 
-# 2. 보컬 트랙 즉각 격리 및 제거 인터페이스
+
 @app.post("/api/vocal-remove")
 def vocal_remove(
-    song: str = Query(..., description="보컬을 제거할 곡명"),
-    remove_vocal: str = Query("Y", description="보컬 제거 여부 (Y/N)"),
-    mute_melody: str = Query("N", description="주멜로디 뮤트 여부 (Y/N)")
+    song: str = Query(...),
+    remove_vocal: str = Query("Y"),
+    mute_melody: str = Query("N")
 ):
     return {
         "status": "success",
-        "message": f"보컬 격리 완료 (Vocal Remove: {remove_vocal} / Mute Melody: {mute_melody})"
+        "message": f"보컬 처리 완료 (remove_vocal={remove_vocal}, mute_melody={mute_melody})"
     }
 
-# 3. 플레이어 시간과 서버 데이터 실시간 동기화 (진행바 대응)
+
 @app.get("/api/sync")
 def sync_player(song: str, current_time: float):
-    # 앱의 진행바와 실시간 동기화 처리
-    return {"song": song, "server_sync_time": current_time, "status": "synchronized"}
+    return {
+        "song": song,
+        "server_sync_time": current_time,
+        "status": "synchronized"
+    }
 
-# 4. 보관함 점3개 메뉴 대응 (재편집 및 각종 파일 다운로드 API 뼈대)
+
 @app.get("/api/download")
 def download_artifact(
-    song: str, 
-    file_type: str = Query(..., description="mp3, wav, mid, total_score, part_score, chord_score")
+    song: str,
+    file_type: str = Query(...)
 ):
     return {
         "status": "success",
@@ -94,51 +168,36 @@ def download_artifact(
         "download_url": f"https://symphony-ai-storage.com/exports/{song}.{file_type if 'score' not in file_type else 'pdf'}"
     }
 
-# =================================================================
-# 5. [트렌드 반영] 소셜 로그인 요청 및 링크 제공 인터페이스
-# =================================================================
+
 @app.get("/api/login")
-def social_login(provider: str = Query(..., description="google 또는 kakao")):
-    
+def social_login(provider: str = Query(...)):
     if provider == "google":
-        # 구글 로그인 페이지로 유저를 강제 이동(Redirect) 시킵니다.
-        # ※ 실제 상용화 시에는 YOUR_GOOGLE_CLIENT_ID를 본인의 구글 콘솔 키로 교체해야 합니다.
         google_oauth_url = (
             "https://accounts.google.com/o/oauth2/v2/auth"
-            "?client_id=85780968680-e713urhtmn3utpcc997b7h78d3machpr.apps.googleusercontent.com"
+            "?client_id=YOUR_GOOGLE_CLIENT_ID"
             "&redirect_uri=https://symphonyai-server.onrender.com/api/login/callback/google"
             "&response_type=code"
             "&scope=email%20profile"
         )
         return RedirectResponse(url=google_oauth_url)
-        
+
     elif provider == "kakao":
-        # 카카오 로그인 페이지로 유저를 강제 이동(Redirect) 시킵니다.
-        # ※ 실제 상용화 시에는 YOUR_KAKAO_REST_KEY를 본인의 카카오 개발자 키로 교체해야 합니다.
         kakao_oauth_url = (
             "https://kauth.kakao.com/oauth/authorize"
-            "?client_id=180c9d0fdb51f06f99b7b97ff373830f" #
+            "?client_id=YOUR_KAKAO_REST_KEY"
             "&redirect_uri=https://symphonyai-server.onrender.com/api/login/callback/kakao"
             "&response_type=code"
         )
         return RedirectResponse(url=kakao_oauth_url)
-        
-    return {"status": "failed", "message": "지원하지 않는 SNS 로그인 제공업체입니다."}
 
-# =================================================================
-# 6. [트렌드 반영] SNS 인증 완료 후 콜백(Callback) 및 앱으로 복귀(딥링크)
-# =================================================================
+    return {"status": "failed", "message": "지원하지 않는 로그인 제공업체입니다."}
+
+
 @app.get("/api/login/callback/{provider}")
 def oauth_callback(provider: str, code: str):
-    # [백엔드 내부 로직 영역]
-    # 여기서 원래는 구글/카카오 서버와 code를 주고받아 유저의 실제 이메일을 받아옵니다.
-    
-    # (테스트용 가상 데이터 설정)
     test_user_id = "symphony_user_777"
     test_email = "symphony_user@gmail.com" if provider == "google" else "kakao_user@kakao.com"
-    
-    # 🌟 핵심: 로그인이 끝나면 유저 정보를 주소 뒤에 달고 '앱 고유의 주소(딥링크)'로 튕겨줍니다.
-    # 스마트폰이 이 주소를 감지하면 웹 브라우저를 닫고 우리 앱을 강제로 다시 켭니다.
+
     app_deep_link_url = f"symphonyai://login_success?user_id={test_user_id}&email={test_email}"
-    
+
     return RedirectResponse(url=app_deep_link_url)
