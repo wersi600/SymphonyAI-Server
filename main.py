@@ -4,7 +4,6 @@ from fastapi.staticfiles import StaticFiles
 import os
 import uuid
 import urllib.parse
-import time
 import requests
 import numpy as np
 from pydub import AudioSegment
@@ -32,9 +31,7 @@ def read_root():
 
 
 def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
-    audio = AudioSegment.from_file(file_path)
-    audio = audio.set_channels(1)
-
+    audio = AudioSegment.from_file(file_path).set_channels(1)
     samples = np.array(audio.get_array_of_samples()).astype(np.float32)
 
     if len(samples) == 0:
@@ -48,50 +45,42 @@ def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
     chunk_size = max(1, len(samples) // target_peaks)
 
     peaks = []
-
     for i in range(0, len(samples), chunk_size):
         chunk = samples[i:i + chunk_size]
         if len(chunk) == 0:
             continue
-        peak = float(np.max(np.abs(chunk)))
-        peaks.append(round(peak, 4))
+        peaks.append(round(float(np.max(np.abs(chunk))), 4))
 
     return peaks[:target_peaks]
 
 
-def call_hf_extract_midi(file_path: str):
+def hf_headers():
     headers = {}
-
     if HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    return headers
 
+
+def call_hf_extract_midi(file_path: str):
     with open(file_path, "rb") as f:
-        files = {
-            "file": (
-                os.path.basename(file_path),
-                f,
-                "audio/mpeg"
-            )
-        }
-
+        files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
         response = requests.post(
             f"{HF_WORKER_URL}/extract-midi",
-            headers=headers,
+            headers=hf_headers(),
             files=files,
-            timeout=300
+            timeout=600
         )
 
     if response.status_code != 200:
         return {
             "status": "failed",
-            "message": f"HF 오류 {response.status_code}: {response.text}",
+            "message": f"HF MIDI 오류 {response.status_code}: {response.text}",
             "midi_url": "",
             "bar_lines_ms": [],
             "bpm": 0
         }
 
     data = response.json()
-
     midi_url = data.get("midi_url", "")
     if midi_url.startswith("/"):
         midi_url = HF_WORKER_URL + midi_url
@@ -102,6 +91,43 @@ def call_hf_extract_midi(file_path: str):
         "midi_url": midi_url,
         "bar_lines_ms": data.get("bar_lines_ms", []),
         "bpm": data.get("bpm", 0)
+    }
+
+
+def call_hf_separate_stems(file_path: str):
+    with open(file_path, "rb") as f:
+        files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+        response = requests.post(
+            f"{HF_WORKER_URL}/separate-stems",
+            headers=hf_headers(),
+            files=files,
+            timeout=900
+        )
+
+    if response.status_code != 200:
+        return {
+            "status": "failed",
+            "message": f"HF Stem 오류 {response.status_code}: {response.text}",
+            "vocal_url": "",
+            "accompaniment_url": ""
+        }
+
+    data = response.json()
+
+    vocal_url = data.get("vocal_url", "")
+    accompaniment_url = data.get("accompaniment_url", "")
+
+    if vocal_url.startswith("/"):
+        vocal_url = HF_WORKER_URL + vocal_url
+
+    if accompaniment_url.startswith("/"):
+        accompaniment_url = HF_WORKER_URL + accompaniment_url
+
+    return {
+        "status": data.get("status", "failed"),
+        "message": data.get("message", ""),
+        "vocal_url": vocal_url,
+        "accompaniment_url": accompaniment_url
     }
 
 
@@ -119,32 +145,37 @@ def analyze_job(job_id: str):
 
         audio = AudioSegment.from_file(file_path)
         duration_ms = len(audio)
-
         waveform_peaks = make_waveform_peaks(file_path, target_peaks=1200)
 
         jobs[job_id]["duration_ms"] = duration_ms
         jobs[job_id]["waveform_peaks"] = waveform_peaks
 
         jobs[job_id]["message"] = "MIDI 추출 중입니다."
-
         midi_result = call_hf_extract_midi(file_path)
 
         if midi_result["status"] == "success":
             jobs[job_id]["midi_url"] = midi_result["midi_url"]
             jobs[job_id]["bar_lines_ms"] = midi_result["bar_lines_ms"]
             jobs[job_id]["bpm"] = midi_result["bpm"]
-            jobs[job_id]["message"] = "분석 완료"
         else:
             jobs[job_id]["midi_url"] = ""
             jobs[job_id]["bar_lines_ms"] = fake_bar_lines_ms(duration_ms)
             jobs[job_id]["bpm"] = 120
-            jobs[job_id]["message"] = "파형 완료 / MIDI 실패: " + midi_result["message"]
+            jobs[job_id]["message"] = "MIDI 실패, 임시 마디선 사용: " + midi_result["message"]
+
+        jobs[job_id]["message"] = "보컬/반주 Stem 분리 중입니다."
+        stem_result = call_hf_separate_stems(file_path)
+
+        if stem_result["status"] == "success":
+            jobs[job_id]["vocal_url"] = stem_result["vocal_url"]
+            jobs[job_id]["accompaniment_url"] = stem_result["accompaniment_url"]
+        else:
+            jobs[job_id]["vocal_url"] = ""
+            jobs[job_id]["accompaniment_url"] = ""
+            jobs[job_id]["stem_message"] = stem_result["message"]
 
         jobs[job_id]["status"] = "done"
-
-        jobs[job_id]["vocal_url"] = ""
-        jobs[job_id]["accompaniment_url"] = ""
-        jobs[job_id]["musicxml_url"] = ""
+        jobs[job_id]["message"] = "분석 완료"
 
     except Exception as e:
         jobs[job_id]["status"] = "failed"
@@ -160,7 +191,6 @@ async def upload_audio_file(
     clean_filename = original_filename.replace(" ", "_")
 
     job_id = str(uuid.uuid4())
-
     safe_filename = f"{job_id}_{clean_filename}"
     file_path = f"static/{safe_filename}"
 
@@ -185,7 +215,8 @@ async def upload_audio_file(
         "vocal_url": "",
         "accompaniment_url": "",
         "midi_url": "",
-        "musicxml_url": ""
+        "musicxml_url": "",
+        "stem_message": ""
     }
 
     background_tasks.add_task(analyze_job, job_id)
@@ -222,7 +253,8 @@ def job_status(job_id: str = Query(...)):
         "vocal_url": job["vocal_url"],
         "accompaniment_url": job["accompaniment_url"],
         "midi_url": job["midi_url"],
-        "musicxml_url": job["musicxml_url"]
+        "musicxml_url": job["musicxml_url"],
+        "stem_message": job.get("stem_message", "")
     }
 
 
@@ -250,10 +282,7 @@ def convert_music(
 
 
 @app.get("/api/download")
-def download_artifact(
-    song: str,
-    file_type: str = Query(...)
-):
+def download_artifact(song: str, file_type: str = Query(...)):
     return {
         "status": "success",
         "file_type": file_type,
@@ -289,7 +318,5 @@ def social_login(provider: str = Query(...)):
 def oauth_callback(provider: str, code: str):
     test_user_id = "symphony_user_777"
     test_email = "symphony_user@gmail.com" if provider == "google" else "kakao_user@kakao.com"
-
     app_deep_link_url = f"symphonyai://login_success?user_id={test_user_id}&email={test_email}"
-
     return RedirectResponse(url=app_deep_link_url)
