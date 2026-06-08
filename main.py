@@ -27,7 +27,10 @@ jobs = {}
 
 @app.get("/")
 def read_root():
-    return {"message": "SymphonyAI 서버 정상 가동 중입니다!"}
+    return {
+        "status": "ok",
+        "message": "SymphonyAI Render 서버 정상 가동 중입니다."
+    }
 
 
 def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
@@ -62,73 +65,93 @@ def hf_headers():
 
 
 def call_hf_extract_midi(file_path: str):
-    with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
-        response = requests.post(
-            f"{HF_WORKER_URL}/extract-midi",
-            headers=hf_headers(),
-            files=files,
-            timeout=600
-        )
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+            response = requests.post(
+                f"{HF_WORKER_URL}/extract-midi",
+                headers=hf_headers(),
+                files=files,
+                timeout=600
+            )
 
-    if response.status_code != 200:
+        if response.status_code != 200:
+            return {
+                "status": "failed",
+                "message": f"HF MIDI 오류 {response.status_code}: {response.text}",
+                "midi_url": "",
+                "bar_lines_ms": [],
+                "bpm": 0
+            }
+
+        data = response.json()
+
+        midi_url = data.get("midi_url", "")
+        if midi_url.startswith("/"):
+            midi_url = HF_WORKER_URL + midi_url
+
+        return {
+            "status": data.get("status", "failed"),
+            "message": data.get("message", ""),
+            "midi_url": midi_url,
+            "bar_lines_ms": data.get("bar_lines_ms", []),
+            "bpm": data.get("bpm", 0)
+        }
+
+    except Exception as e:
         return {
             "status": "failed",
-            "message": f"HF MIDI 오류 {response.status_code}: {response.text}",
+            "message": f"MIDI 호출 예외: {type(e).__name__} / {str(e)}",
             "midi_url": "",
             "bar_lines_ms": [],
             "bpm": 0
         }
 
-    data = response.json()
-    midi_url = data.get("midi_url", "")
-    if midi_url.startswith("/"):
-        midi_url = HF_WORKER_URL + midi_url
-
-    return {
-        "status": data.get("status", "failed"),
-        "message": data.get("message", ""),
-        "midi_url": midi_url,
-        "bar_lines_ms": data.get("bar_lines_ms", []),
-        "bpm": data.get("bpm", 0)
-    }
-
 
 def call_hf_separate_stems(file_path: str):
-    with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
-        response = requests.post(
-            f"{HF_WORKER_URL}/separate-stems",
-            headers=hf_headers(),
-            files=files,
-            timeout=900
-        )
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+            response = requests.post(
+                f"{HF_WORKER_URL}/separate-stems",
+                headers=hf_headers(),
+                files=files,
+                timeout=900
+            )
 
-    if response.status_code != 200:
+        if response.status_code != 200:
+            return {
+                "status": "failed",
+                "message": f"HF Stem 오류 {response.status_code}: {response.text}",
+                "vocal_url": "",
+                "accompaniment_url": ""
+            }
+
+        data = response.json()
+
+        vocal_url = data.get("vocal_url", "")
+        accompaniment_url = data.get("accompaniment_url", "")
+
+        if vocal_url.startswith("/"):
+            vocal_url = HF_WORKER_URL + vocal_url
+
+        if accompaniment_url.startswith("/"):
+            accompaniment_url = HF_WORKER_URL + accompaniment_url
+
+        return {
+            "status": data.get("status", "failed"),
+            "message": data.get("message", ""),
+            "vocal_url": vocal_url,
+            "accompaniment_url": accompaniment_url
+        }
+
+    except Exception as e:
         return {
             "status": "failed",
-            "message": f"HF Stem 오류 {response.status_code}: {response.text}",
+            "message": f"Stem 호출 예외: {type(e).__name__} / {str(e)}",
             "vocal_url": "",
             "accompaniment_url": ""
         }
-
-    data = response.json()
-
-    vocal_url = data.get("vocal_url", "")
-    accompaniment_url = data.get("accompaniment_url", "")
-
-    if vocal_url.startswith("/"):
-        vocal_url = HF_WORKER_URL + vocal_url
-
-    if accompaniment_url.startswith("/"):
-        accompaniment_url = HF_WORKER_URL + accompaniment_url
-
-    return {
-        "status": data.get("status", "failed"),
-        "message": data.get("message", ""),
-        "vocal_url": vocal_url,
-        "accompaniment_url": accompaniment_url
-    }
 
 
 def fake_bar_lines_ms(duration_ms: int, bpm: int = 120, beats_per_bar: int = 4):
@@ -140,6 +163,7 @@ def analyze_job(job_id: str):
     try:
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["message"] = "오디오 파형 분석 중입니다."
+        jobs[job_id]["debug_step"] = "waveform"
 
         file_path = jobs[job_id]["file_path"]
 
@@ -151,7 +175,11 @@ def analyze_job(job_id: str):
         jobs[job_id]["waveform_peaks"] = waveform_peaks
 
         jobs[job_id]["message"] = "MIDI 추출 중입니다."
+        jobs[job_id]["debug_step"] = "midi"
         midi_result = call_hf_extract_midi(file_path)
+
+        jobs[job_id]["midi_status"] = midi_result["status"]
+        jobs[job_id]["midi_message"] = midi_result["message"]
 
         if midi_result["status"] == "success":
             jobs[job_id]["midi_url"] = midi_result["midi_url"]
@@ -161,10 +189,13 @@ def analyze_job(job_id: str):
             jobs[job_id]["midi_url"] = ""
             jobs[job_id]["bar_lines_ms"] = fake_bar_lines_ms(duration_ms)
             jobs[job_id]["bpm"] = 120
-            jobs[job_id]["message"] = "MIDI 실패, 임시 마디선 사용: " + midi_result["message"]
 
         jobs[job_id]["message"] = "보컬/반주 Stem 분리 중입니다."
+        jobs[job_id]["debug_step"] = "stem"
         stem_result = call_hf_separate_stems(file_path)
+
+        jobs[job_id]["stem_status"] = stem_result["status"]
+        jobs[job_id]["stem_message"] = stem_result["message"]
 
         if stem_result["status"] == "success":
             jobs[job_id]["vocal_url"] = stem_result["vocal_url"]
@@ -172,14 +203,19 @@ def analyze_job(job_id: str):
         else:
             jobs[job_id]["vocal_url"] = ""
             jobs[job_id]["accompaniment_url"] = ""
-            jobs[job_id]["stem_message"] = stem_result["message"]
 
         jobs[job_id]["status"] = "done"
-        jobs[job_id]["message"] = "분석 완료"
+        jobs[job_id]["debug_step"] = "done"
+
+        if jobs[job_id]["vocal_url"] and jobs[job_id]["accompaniment_url"]:
+            jobs[job_id]["message"] = "분석 완료 / Stem 준비완료"
+        else:
+            jobs[job_id]["message"] = "분석 완료 / Stem 실패: " + jobs[job_id]["stem_message"]
 
     except Exception as e:
         jobs[job_id]["status"] = "failed"
-        jobs[job_id]["message"] = str(e)
+        jobs[job_id]["message"] = f"분석 오류: {type(e).__name__} / {str(e)}"
+        jobs[job_id]["debug_step"] = "error"
 
 
 @app.post("/api/file/upload")
@@ -204,6 +240,7 @@ async def upload_audio_file(
         "job_id": job_id,
         "status": "queued",
         "message": "작업 대기 중입니다.",
+        "debug_step": "queued",
         "file_name": clean_filename,
         "stored_file_name": safe_filename,
         "file_path": file_path,
@@ -216,6 +253,9 @@ async def upload_audio_file(
         "accompaniment_url": "",
         "midi_url": "",
         "musicxml_url": "",
+        "midi_status": "",
+        "midi_message": "",
+        "stem_status": "",
         "stem_message": ""
     }
 
@@ -235,7 +275,8 @@ def job_status(job_id: str = Query(...)):
     if job_id not in jobs:
         return {
             "status": "failed",
-            "message": "job_id를 찾을 수 없습니다."
+            "message": "job_id를 찾을 수 없습니다.",
+            "job_id": job_id
         }
 
     job = jobs[job_id]
@@ -243,6 +284,7 @@ def job_status(job_id: str = Query(...)):
     return {
         "status": job["status"],
         "message": job["message"],
+        "debug_step": job.get("debug_step", ""),
         "job_id": job_id,
         "file_name": job["file_name"],
         "audio_url": job["audio_url"],
@@ -254,6 +296,9 @@ def job_status(job_id: str = Query(...)):
         "accompaniment_url": job["accompaniment_url"],
         "midi_url": job["midi_url"],
         "musicxml_url": job["musicxml_url"],
+        "midi_status": job.get("midi_status", ""),
+        "midi_message": job.get("midi_message", ""),
+        "stem_status": job.get("stem_status", ""),
         "stem_message": job.get("stem_message", "")
     }
 
@@ -311,7 +356,10 @@ def social_login(provider: str = Query(...)):
         )
         return RedirectResponse(url=kakao_oauth_url)
 
-    return {"status": "failed", "message": "지원하지 않는 로그인 제공업체입니다."}
+    return {
+        "status": "failed",
+        "message": "지원하지 않는 로그인 제공업체입니다."
+    }
 
 
 @app.get("/api/login/callback/{provider}")
