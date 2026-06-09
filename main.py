@@ -8,6 +8,12 @@ import requests
 import numpy as np
 from pydub import AudioSegment
 import imageio_ffmpeg
+import shutil
+import logging
+
+# 로그 세팅 (Render 로그 모니터링용)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("SymphonyAI")
 
 app = FastAPI()
 
@@ -22,8 +28,8 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
+# 주의: 대규모 서비스시 Redis나 DB로 교체 권장 (우선 유지하되 메모리 관리 강화)
 jobs = {}
-
 
 @app.get("/")
 def read_root():
@@ -32,49 +38,43 @@ def read_root():
         "message": "REMO / SymphonyAI Render 서버 정상 가동 중입니다."
     }
 
-
 def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
-    audio = AudioSegment.from_file(file_path).set_channels(1)
-    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+    try:
+        audio = AudioSegment.from_file(file_path).set_channels(1)
+        samples = np.array(audio.get_array_of_samples()).astype(np.float32)
 
-    if len(samples) == 0:
-        return []
+        if len(samples) == 0:
+            return []
 
-    max_value = np.max(np.abs(samples))
-    if max_value == 0:
-        return [0.0] * target_peaks
+        max_value = np.max(np.abs(samples))
+        if max_value == 0:
+            return [0.0] * target_peaks
 
-    samples = samples / max_value
-    chunk_size = max(1, len(samples) // target_peaks)
+        samples = samples / max_value
+        chunk_size = max(1, len(samples) // target_peaks)
 
-    peaks = []
+        peaks = []
+        for i in range(0, len(samples), chunk_size):
+            chunk = samples[i:i + chunk_size]
+            if len(chunk) == 0:
+                continue
+            peaks.append(round(float(np.max(np.abs(chunk))), 4))
 
-    for i in range(0, len(samples), chunk_size):
-        chunk = samples[i:i + chunk_size]
-        if len(chunk) == 0:
-            continue
-        peaks.append(round(float(np.max(np.abs(chunk))), 4))
-
-    return peaks[:target_peaks]
-
+        return peaks[:target_peaks]
+    except Exception as e:
+        logger.error(f"파형 추출 실패: {str(e)}")
+        return [0.05] * target_peaks
 
 def hf_headers():
     headers = {}
-
     if HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
-
     return headers
-
 
 def call_hf_extract_midi(file_path: str):
     try:
         midi_url = f"{HF_WORKER_URL}/extract-midi"
-
-        print("========== MIDI DEBUG ==========")
-        print("HF_WORKER_URL =", HF_WORKER_URL)
-        print("MIDI URL =", midi_url)
-        print("================================")
+        logger.info(f"MIDI 추출 시작: {midi_url}")
 
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
@@ -84,9 +84,6 @@ def call_hf_extract_midi(file_path: str):
                 files=files,
                 timeout=600
             )
-
-        print("MIDI STATUS =", response.status_code)
-        print("MIDI TEXT =", response.text[:500])
 
         if response.status_code != 200:
             return {
@@ -98,9 +95,7 @@ def call_hf_extract_midi(file_path: str):
             }
 
         data = response.json()
-
         result_midi_url = data.get("midi_url", "")
-
         if result_midi_url.startswith("/"):
             result_midi_url = HF_WORKER_URL + result_midi_url
 
@@ -111,7 +106,6 @@ def call_hf_extract_midi(file_path: str):
             "bar_lines_ms": data.get("bar_lines_ms", []),
             "bpm": data.get("bpm", 0)
         }
-
     except Exception as e:
         return {
             "status": "failed",
@@ -121,15 +115,10 @@ def call_hf_extract_midi(file_path: str):
             "bpm": 0
         }
 
-
 def call_hf_separate_stems(file_path: str):
     try:
         stem_url = f"{HF_WORKER_URL}/separate-stems"
-
-        print("========== STEM DEBUG ==========")
-        print("HF_WORKER_URL =", HF_WORKER_URL)
-        print("STEM URL =", stem_url)
-        print("================================")
+        logger.info(f"Stem 분리 시작: {stem_url}")
 
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
@@ -140,9 +129,6 @@ def call_hf_separate_stems(file_path: str):
                 timeout=900
             )
 
-        print("STEM STATUS =", response.status_code)
-        print("STEM TEXT =", response.text[:1000])
-
         if response.status_code != 200:
             return {
                 "status": "failed",
@@ -152,19 +138,13 @@ def call_hf_separate_stems(file_path: str):
             }
 
         data = response.json()
-
         vocal_url = data.get("vocal_url", "")
-        accompaniment_url = data.get("accompaniment_url", "")
-
         if vocal_url.startswith("/"):
             vocal_url = HF_WORKER_URL + vocal_url
 
+        accompaniment_url = data.get("accompaniment_url", "")
         if accompaniment_url.startswith("/"):
             accompaniment_url = HF_WORKER_URL + accompaniment_url
-
-        print("STEM RESULT STATUS =", data.get("status", ""))
-        print("VOCAL URL =", vocal_url)
-        print("ACCOMPANIMENT URL =", accompaniment_url)
 
         return {
             "status": data.get("status", "failed"),
@@ -172,7 +152,6 @@ def call_hf_separate_stems(file_path: str):
             "vocal_url": vocal_url,
             "accompaniment_url": accompaniment_url
         }
-
     except Exception as e:
         return {
             "status": "failed",
@@ -181,11 +160,15 @@ def call_hf_separate_stems(file_path: str):
             "accompaniment_url": ""
         }
 
-
-def fake_bar_lines_ms(duration_ms: int, bpm: int = 120, beats_per_bar: int = 4):
-    bar_ms = int((60000 / bpm) * beats_per_bar)
-    return list(range(0, duration_ms + bar_ms, bar_ms))
-
+def fake_bar_lines_ms(duration_ms: int, bpm: float = 120.0, beats_per_bar: int = 4):
+    # 정밀한 부동소수점 계산 후 정수ms 변환
+    bar_ms = (60000.0 / bpm) * beats_per_bar
+    lines = []
+    current = 0.0
+    while current <= duration_ms:
+        lines.append(int(current))
+        current += bar_ms
+    return lines
 
 def analyze_job(job_id: str):
     try:
@@ -202,9 +185,9 @@ def analyze_job(job_id: str):
         jobs[job_id]["duration_ms"] = duration_ms
         jobs[job_id]["waveform_peaks"] = waveform_peaks
 
+        # 1. MIDI 추출 단계
         jobs[job_id]["message"] = "MIDI 추출 중입니다."
         jobs[job_id]["debug_step"] = "midi"
-
         midi_result = call_hf_extract_midi(file_path)
 
         jobs[job_id]["midi_status"] = midi_result["status"]
@@ -216,12 +199,12 @@ def analyze_job(job_id: str):
             jobs[job_id]["bpm"] = midi_result["bpm"]
         else:
             jobs[job_id]["midi_url"] = ""
-            jobs[job_id]["bar_lines_ms"] = fake_bar_lines_ms(duration_ms)
-            jobs[job_id]["bpm"] = 120
+            jobs[job_id]["bar_lines_ms"] = fake_bar_lines_ms(duration_ms, bpm=120.0)
+            jobs[job_id]["bpm"] = 120.0
 
+        # 2. Stem 분리 단계
         jobs[job_id]["message"] = "보컬/반주 Stem 분리 중입니다."
         jobs[job_id]["debug_step"] = "stem"
-
         stem_result = call_hf_separate_stems(file_path)
 
         jobs[job_id]["stem_status"] = stem_result["status"]
@@ -234,19 +217,19 @@ def analyze_job(job_id: str):
             jobs[job_id]["vocal_url"] = ""
             jobs[job_id]["accompaniment_url"] = ""
 
+        # 3. 최종 완료 처리
         jobs[job_id]["status"] = "done"
         jobs[job_id]["debug_step"] = "done"
-
         if jobs[job_id]["vocal_url"] and jobs[job_id]["accompaniment_url"]:
-            jobs[job_id]["message"] = "분석 완료 / Stem URL 있음"
+            jobs[job_id]["message"] = "분석 완료 / Stem 플레이 준비 완료"
         else:
-            jobs[job_id]["message"] = "분석 완료 / Stem URL 없음"
+            jobs[job_id]["message"] = "분석 완료 / 일부 고음질 음원 유실 가능성 있음"
 
     except Exception as e:
+        logger.error(f"비동기 태스크 내부 치명적 에러: {str(e)}")
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["message"] = f"분석 오류: {type(e).__name__} / {str(e)}"
         jobs[job_id]["debug_step"] = "error"
-
 
 @app.post("/api/file/upload")
 async def upload_audio_file(
@@ -260,8 +243,9 @@ async def upload_audio_file(
     safe_filename = f"{job_id}_{clean_filename}"
     file_path = f"static/{safe_filename}"
 
-    with open(file_path, "wb+") as file_object:
-        file_object.write(file.file.read())
+    # 버퍼를 이용한 청크 단위 안전 저장 (Render 서버 OOM 방지)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
     safe_url_filename = urllib.parse.quote(safe_filename)
     full_audio_url = f"{BASE_URL}/static/{safe_url_filename}"
@@ -278,7 +262,7 @@ async def upload_audio_file(
         "duration_ms": 0,
         "waveform_peaks": [],
         "bar_lines_ms": [],
-        "bpm": 0,
+        "bpm": 0.0,
         "vocal_url": "",
         "accompaniment_url": "",
         "midi_url": "",
@@ -299,18 +283,16 @@ async def upload_audio_file(
         "file_name": clean_filename
     }
 
-
 @app.get("/api/job/status")
 def job_status(job_id: str = Query(...)):
     if job_id not in jobs:
         return {
             "status": "failed",
-            "message": "job_id를 찾을 수 없습니다.",
+            "message": "서버 휴면 전환으로 인해 작업 메모리가 만료되었습니다. 앱에서 파일을 다시 올려주세요.",
             "job_id": job_id
         }
 
     job = jobs[job_id]
-
     return {
         "status": job["status"],
         "message": job["message"],
@@ -331,7 +313,6 @@ def job_status(job_id: str = Query(...)):
         "stem_status": job.get("stem_status", ""),
         "stem_message": job.get("stem_message", "")
     }
-
 
 @app.post("/api/convert")
 def convert_music(
@@ -355,7 +336,6 @@ def convert_music(
         "mute_melody": mute_melody
     }
 
-
 @app.get("/api/download")
 def download_artifact(song: str, file_type: str = Query(...)):
     return {
@@ -363,7 +343,6 @@ def download_artifact(song: str, file_type: str = Query(...)):
         "file_type": file_type,
         "download_url": f"https://symphony-ai-storage.com/exports/{song}.{file_type if 'score' not in file_type else 'pdf'}"
     }
-
 
 @app.get("/api/login")
 def social_login(provider: str = Query(...)):
@@ -390,7 +369,6 @@ def social_login(provider: str = Query(...)):
         "status": "failed",
         "message": "지원하지 않는 로그인 제공업체입니다."
     }
-
 
 @app.get("/api/login/callback/{provider}")
 def oauth_callback(provider: str, code: str):
