@@ -29,7 +29,7 @@ jobs = {}
 def read_root():
     return {
         "status": "ok",
-        "message": "SymphonyAI Render 서버 정상 가동 중입니다."
+        "message": "REMO / SymphonyAI Render 서버 정상 가동 중입니다."
     }
 
 
@@ -48,6 +48,7 @@ def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
     chunk_size = max(1, len(samples) // target_peaks)
 
     peaks = []
+
     for i in range(0, len(samples), chunk_size):
         chunk = samples[i:i + chunk_size]
         if len(chunk) == 0:
@@ -59,26 +60,38 @@ def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
 
 def hf_headers():
     headers = {}
+
     if HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
     return headers
 
 
 def call_hf_extract_midi(file_path: str):
     try:
+        midi_url = f"{HF_WORKER_URL}/extract-midi"
+
+        print("========== MIDI DEBUG ==========")
+        print("HF_WORKER_URL =", HF_WORKER_URL)
+        print("MIDI URL =", midi_url)
+        print("================================")
+
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
             response = requests.post(
-                f"{HF_WORKER_URL}/extract-midi",
+                midi_url,
                 headers=hf_headers(),
                 files=files,
                 timeout=600
             )
 
+        print("MIDI STATUS =", response.status_code)
+        print("MIDI TEXT =", response.text[:500])
+
         if response.status_code != 200:
             return {
                 "status": "failed",
-                "message": f"HF MIDI 오류 {response.status_code}: {response.text}",
+                "message": f"HF MIDI 오류 {response.status_code}: {response.text[:500]}",
                 "midi_url": "",
                 "bar_lines_ms": [],
                 "bpm": 0
@@ -86,14 +99,15 @@ def call_hf_extract_midi(file_path: str):
 
         data = response.json()
 
-        midi_url = data.get("midi_url", "")
-        if midi_url.startswith("/"):
-            midi_url = HF_WORKER_URL + midi_url
+        result_midi_url = data.get("midi_url", "")
+
+        if result_midi_url.startswith("/"):
+            result_midi_url = HF_WORKER_URL + result_midi_url
 
         return {
             "status": data.get("status", "failed"),
             "message": data.get("message", ""),
-            "midi_url": midi_url,
+            "midi_url": result_midi_url,
             "bar_lines_ms": data.get("bar_lines_ms", []),
             "bpm": data.get("bpm", 0)
         }
@@ -110,19 +124,29 @@ def call_hf_extract_midi(file_path: str):
 
 def call_hf_separate_stems(file_path: str):
     try:
+        stem_url = f"{HF_WORKER_URL}/separate-stems"
+
+        print("========== STEM DEBUG ==========")
+        print("HF_WORKER_URL =", HF_WORKER_URL)
+        print("STEM URL =", stem_url)
+        print("================================")
+
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
             response = requests.post(
-                f"{HF_WORKER_URL}/separate-stems",
+                stem_url,
                 headers=hf_headers(),
                 files=files,
                 timeout=900
             )
 
+        print("STEM STATUS =", response.status_code)
+        print("STEM TEXT =", response.text[:1000])
+
         if response.status_code != 200:
             return {
                 "status": "failed",
-                "message": f"HF Stem 오류 {response.status_code}: {response.text}",
+                "message": f"HF Stem 오류 {response.status_code}: {response.text[:1000]}",
                 "vocal_url": "",
                 "accompaniment_url": ""
             }
@@ -137,6 +161,10 @@ def call_hf_separate_stems(file_path: str):
 
         if accompaniment_url.startswith("/"):
             accompaniment_url = HF_WORKER_URL + accompaniment_url
+
+        print("STEM RESULT STATUS =", data.get("status", ""))
+        print("VOCAL URL =", vocal_url)
+        print("ACCOMPANIMENT URL =", accompaniment_url)
 
         return {
             "status": data.get("status", "failed"),
@@ -176,6 +204,7 @@ def analyze_job(job_id: str):
 
         jobs[job_id]["message"] = "MIDI 추출 중입니다."
         jobs[job_id]["debug_step"] = "midi"
+
         midi_result = call_hf_extract_midi(file_path)
 
         jobs[job_id]["midi_status"] = midi_result["status"]
@@ -192,6 +221,7 @@ def analyze_job(job_id: str):
 
         jobs[job_id]["message"] = "보컬/반주 Stem 분리 중입니다."
         jobs[job_id]["debug_step"] = "stem"
+
         stem_result = call_hf_separate_stems(file_path)
 
         jobs[job_id]["stem_status"] = stem_result["status"]
@@ -208,9 +238,9 @@ def analyze_job(job_id: str):
         jobs[job_id]["debug_step"] = "done"
 
         if jobs[job_id]["vocal_url"] and jobs[job_id]["accompaniment_url"]:
-            jobs[job_id]["message"] = "분석 완료 / Stem 준비완료"
+            jobs[job_id]["message"] = "분석 완료 / Stem URL 있음"
         else:
-            jobs[job_id]["message"] = "분석 완료 / Stem 실패: " + jobs[job_id]["stem_message"]
+            jobs[job_id]["message"] = "분석 완료 / Stem URL 없음"
 
     except Exception as e:
         jobs[job_id]["status"] = "failed"
