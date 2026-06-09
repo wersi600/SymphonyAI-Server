@@ -66,10 +66,7 @@ def make_waveform_peaks(file_path: str, target_peaks: int = 1200):
         return [0.05] * target_peaks
 
 def hf_headers():
-    headers = {}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
-    return headers
+    return {}
 
 def call_hf_extract_midi(file_path: str):
     try:
