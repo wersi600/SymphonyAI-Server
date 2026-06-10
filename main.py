@@ -114,8 +114,9 @@ def call_hf_extract_midi(file_path: str):
 
 def call_hf_separate_stems(file_path: str):
     try:
+        # [수정 가동부] 허깅페이스 FastAPI 규격(/separate-stems)에 맞춰 포워딩 주소 변경
         stem_url = f"{HF_WORKER_URL}/separate-stems"
-        logger.info(f"Stem 분리 시작: {stem_url}")
+        logger.info(f"Stem 분리 중계 요청 시작: {stem_url}")
 
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
@@ -158,7 +159,6 @@ def call_hf_separate_stems(file_path: str):
         }
 
 def fake_bar_lines_ms(duration_ms: int, bpm: float = 120.0, beats_per_bar: int = 4):
-    # 정밀한 부동소수점 계산 후 정수ms 변환
     bar_ms = (60000.0 / bpm) * beats_per_bar
     lines = []
     current = 0.0
