@@ -16,7 +16,6 @@ logger = logging.getLogger("REMO-Backend")
 
 app = FastAPI()
 
-# 외부 노출 브랜드는 REMO, 내부 서버명은 기존 SymphonyAI 구조 유지
 BASE_URL = "https://symphonyai-server.onrender.com"
 HF_WORKER_URL = "https://wers600-symphonyai-audio-worker.hf.space"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
@@ -27,7 +26,6 @@ if not os.path.exists("static"):
 app.mount("/static", StaticFiles(directory="static"), name="static")
 AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
-# 무료 Render 환경에서는 메모리 저장. 추후 Redis/DB 권장.
 jobs = {}
 
 
@@ -40,18 +38,20 @@ def read_root():
 
 
 def hf_headers():
-    # HF Space가 Public이면 빈 헤더로 둔다.
-    # Private Space로 바꾸면 아래 Authorization 사용.
     if HF_TOKEN:
         return {"Authorization": f"Bearer {HF_TOKEN}"}
     return {}
 
 
+def normalize_hf_url(url: str):
+    if not url:
+        return ""
+    if url.startswith("/"):
+        return HF_WORKER_URL + url
+    return url
+
+
 def make_waveform_peaks(file_path: str, target_peaks: int = 12000):
-    """
-    앱 줌 확대용 고해상도 waveform peak 생성.
-    기존 1200보다 10배 촘촘하게 보냄.
-    """
     try:
         audio = AudioSegment.from_file(file_path).set_channels(1)
         samples = np.array(audio.get_array_of_samples()).astype(np.float32)
@@ -93,22 +93,14 @@ def fake_bar_lines_ms(duration_ms: int, bpm: float = 120.0, beats_per_bar: int =
     return lines
 
 
-def normalize_hf_url(url: str):
-    if not url:
-        return ""
-    if url.startswith("/"):
-        return HF_WORKER_URL + url
-    return url
-
-
 def call_hf_extract_midi(file_path: str):
     """
-    HF Audio Worker /extract-midi 호출.
-    반환값은 앱에서 MIDI 안정화에 필요한 값 중심으로 정리.
+    HF /extract-midi 호출.
+    이제 HF는 full.mid, melody.mid, midi_accompaniment.mid를 같이 반환합니다.
     """
     try:
         midi_url = f"{HF_WORKER_URL}/extract-midi"
-        logger.info(f"HF MIDI 추출 요청: {midi_url}")
+        logger.info(f"HF 분리 MIDI 추출 요청: {midi_url}")
 
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
@@ -116,7 +108,7 @@ def call_hf_extract_midi(file_path: str):
                 midi_url,
                 headers=hf_headers(),
                 files=files,
-                timeout=900
+                timeout=1200
             )
 
         if response.status_code != 200:
@@ -124,6 +116,10 @@ def call_hf_extract_midi(file_path: str):
                 "status": "failed",
                 "message": f"HF MIDI 오류 {response.status_code}: {response.text[:1000]}",
                 "midi_url": "",
+                "melody_midi_url": "",
+                "accompaniment_midi_url": "",
+                "vocal_url": "",
+                "accompaniment_url": "",
                 "bar_lines_ms": [],
                 "bpm": 0.0,
                 "bar_offset_ms": 0
@@ -134,6 +130,10 @@ def call_hf_extract_midi(file_path: str):
             "status": data.get("status", "failed"),
             "message": data.get("message", ""),
             "midi_url": normalize_hf_url(data.get("midi_url", "")),
+            "melody_midi_url": normalize_hf_url(data.get("melody_midi_url", "")),
+            "accompaniment_midi_url": normalize_hf_url(data.get("accompaniment_midi_url", "")),
+            "vocal_url": normalize_hf_url(data.get("vocal_url", "")),
+            "accompaniment_url": normalize_hf_url(data.get("accompaniment_url", "")),
             "bar_lines_ms": data.get("bar_lines_ms", []),
             "bpm": float(data.get("bpm", 0.0) or 0.0),
             "bar_offset_ms": int(data.get("bar_offset_ms", 0) or 0)
@@ -143,51 +143,13 @@ def call_hf_extract_midi(file_path: str):
             "status": "failed",
             "message": f"MIDI 호출 예외: {type(e).__name__} / {str(e)}",
             "midi_url": "",
+            "melody_midi_url": "",
+            "accompaniment_midi_url": "",
+            "vocal_url": "",
+            "accompaniment_url": "",
             "bar_lines_ms": [],
             "bpm": 0.0,
             "bar_offset_ms": 0
-        }
-
-
-def call_hf_separate_stems(file_path: str):
-    """
-    HF Audio Worker /separate-stems 호출.
-    개발 중에는 librosa HPSS 기반 임시 Stem.
-    """
-    try:
-        stem_url = f"{HF_WORKER_URL}/separate-stems"
-        logger.info(f"HF Stem 분리 요청: {stem_url}")
-
-        with open(file_path, "rb") as f:
-            files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
-            response = requests.post(
-                stem_url,
-                headers=hf_headers(),
-                files=files,
-                timeout=900
-            )
-
-        if response.status_code != 200:
-            return {
-                "status": "failed",
-                "message": f"HF Stem 오류 {response.status_code}: {response.text[:1000]}",
-                "vocal_url": "",
-                "accompaniment_url": ""
-            }
-
-        data = response.json()
-        return {
-            "status": data.get("status", "failed"),
-            "message": data.get("message", ""),
-            "vocal_url": normalize_hf_url(data.get("vocal_url", "")),
-            "accompaniment_url": normalize_hf_url(data.get("accompaniment_url", ""))
-        }
-    except Exception as e:
-        return {
-            "status": "failed",
-            "message": f"Stem 호출 예외: {type(e).__name__} / {str(e)}",
-            "vocal_url": "",
-            "accompaniment_url": ""
         }
 
 
@@ -199,7 +161,6 @@ def analyze_job(job_id: str):
         job["debug_step"] = "waveform"
 
         file_path = job["file_path"]
-
         audio = AudioSegment.from_file(file_path)
         duration_ms = len(audio)
         waveform_peaks = make_waveform_peaks(file_path, target_peaks=12000)
@@ -207,9 +168,8 @@ def analyze_job(job_id: str):
         job["duration_ms"] = duration_ms
         job["waveform_peaks"] = waveform_peaks
 
-        # 1. MIDI 추출 먼저 안정화
-        job["message"] = "MIDI/BPM/마디선 추출 중입니다."
-        job["debug_step"] = "midi"
+        job["message"] = "Stem 기반 원곡/주멜로디/반주 MIDI 추출 중입니다."
+        job["debug_step"] = "split_midi"
         midi_result = call_hf_extract_midi(file_path)
 
         job["midi_status"] = midi_result["status"]
@@ -218,51 +178,36 @@ def analyze_job(job_id: str):
 
         if midi_result["status"] == "success" and midi_result.get("midi_url"):
             bpm = float(midi_result.get("bpm", 0.0) or 0.0)
-            if bpm <= 0:
-                bpm = 120.0
-
-            bars = midi_result.get("bar_lines_ms", [])
-            if not bars:
-                bars = fake_bar_lines_ms(duration_ms, bpm=bpm)
-
-            job["midi_url"] = midi_result["midi_url"]
-            job["bar_lines_ms"] = bars
-            job["bpm"] = bpm
+            job["midi_url"] = midi_result.get("midi_url", "")
+            job["melody_midi_url"] = midi_result.get("melody_midi_url", "")
+            job["accompaniment_midi_url"] = midi_result.get("accompaniment_midi_url", "")
+            job["vocal_url"] = midi_result.get("vocal_url", "")
+            job["accompaniment_url"] = midi_result.get("accompaniment_url", "")
+            job["bpm"] = bpm if bpm > 0 else 120.0
+            job["bar_lines_ms"] = midi_result.get("bar_lines_ms", []) or fake_bar_lines_ms(duration_ms, job["bpm"])
         else:
-            # 실패해도 앱이 멈추지 않도록 최소 정보 제공
             job["midi_url"] = ""
+            job["melody_midi_url"] = ""
+            job["accompaniment_midi_url"] = ""
+            job["vocal_url"] = ""
+            job["accompaniment_url"] = ""
             job["bpm"] = 120.0
             job["bar_lines_ms"] = fake_bar_lines_ms(duration_ms, bpm=120.0)
 
-        # 2. Stem 분리
-        job["message"] = "보컬/반주 Stem 분리 중입니다."
-        job["debug_step"] = "stem"
-        stem_result = call_hf_separate_stems(file_path)
-
-        job["stem_status"] = stem_result["status"]
-        job["stem_message"] = stem_result["message"]
-
-        if stem_result["status"] == "success":
-            job["vocal_url"] = stem_result["vocal_url"]
-            job["accompaniment_url"] = stem_result["accompaniment_url"]
+        # HF /extract-midi에서 stem wav도 같이 반환하므로 별도 /separate-stems 재호출은 하지 않습니다.
+        if job["vocal_url"] and job["accompaniment_url"]:
+            job["stem_status"] = "success"
+            job["stem_message"] = "MIDI 추출 단계에서 Stem URL 함께 생성됨"
         else:
-            job["vocal_url"] = ""
-            job["accompaniment_url"] = ""
+            job["stem_status"] = "failed"
+            job["stem_message"] = "Stem URL 없음"
 
         job["status"] = "done"
         job["debug_step"] = "done"
-
-        if job["midi_url"] and job["vocal_url"] and job["accompaniment_url"]:
-            job["message"] = "분석 완료 / MIDI + Stem 준비 완료"
-        elif job["midi_url"]:
-            job["message"] = "분석 완료 / MIDI 준비 완료 / Stem 일부 실패"
-        elif job["vocal_url"] and job["accompaniment_url"]:
-            job["message"] = "분석 완료 / Stem 준비 완료 / MIDI 실패"
-        else:
-            job["message"] = "분석 완료 / 일부 분석 실패. 원곡 재생은 가능합니다."
+        job["message"] = "분석 완료 / 원곡·주멜로디·반주 MIDI 준비 완료"
 
     except Exception as e:
-        logger.error(f"작업 내부 치명적 오류: {type(e).__name__} / {str(e)}")
+        logger.error(f"비동기 태스크 내부 치명적 에러: {type(e).__name__} / {str(e)}")
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["message"] = f"분석 오류: {type(e).__name__} / {str(e)}"
         jobs[job_id]["debug_step"] = "error"
@@ -298,11 +243,13 @@ async def upload_audio_file(
         "duration_ms": 0,
         "waveform_peaks": [],
         "bar_lines_ms": [],
-        "bpm": 0.0,
         "bar_offset_ms": 0,
+        "bpm": 0.0,
         "vocal_url": "",
         "accompaniment_url": "",
         "midi_url": "",
+        "melody_midi_url": "",
+        "accompaniment_midi_url": "",
         "musicxml_url": "",
         "midi_status": "",
         "midi_message": "",
@@ -326,7 +273,7 @@ def job_status(job_id: str = Query(...)):
     if job_id not in jobs:
         return {
             "status": "failed",
-            "message": "서버 휴면 전환으로 인해 작업 메모리가 만료되었습니다. 앱에서 파일을 다시 올려주세요.",
+            "message": "서버 휴면 전환으로 작업 메모리가 만료되었습니다. 앱에서 파일을 다시 올려주세요.",
             "job_id": job_id
         }
 
@@ -341,11 +288,13 @@ def job_status(job_id: str = Query(...)):
         "duration_ms": job["duration_ms"],
         "waveform_peaks": job["waveform_peaks"],
         "bar_lines_ms": job["bar_lines_ms"],
-        "bpm": job["bpm"],
         "bar_offset_ms": job.get("bar_offset_ms", 0),
+        "bpm": job["bpm"],
         "vocal_url": job["vocal_url"],
         "accompaniment_url": job["accompaniment_url"],
         "midi_url": job["midi_url"],
+        "melody_midi_url": job.get("melody_midi_url", ""),
+        "accompaniment_midi_url": job.get("accompaniment_midi_url", ""),
         "musicxml_url": job["musicxml_url"],
         "midi_status": job.get("midi_status", ""),
         "midi_message": job.get("midi_message", ""),
@@ -366,7 +315,7 @@ def convert_music(
 ):
     return {
         "status": "processing",
-        "message": "MusicGen 재편집 작업이 큐에 등록되었습니다.",
+        "message": "AI 재편집 작업이 큐에 등록되었습니다.",
         "song": song,
         "prompt": prompt,
         "start_ms": start_ms,
@@ -398,7 +347,7 @@ def social_login(provider: str = Query(...)):
         )
         return RedirectResponse(url=google_oauth_url)
 
-    if provider == "kakao":
+    elif provider == "kakao":
         kakao_oauth_url = (
             "https://kauth.kakao.com/oauth/authorize"
             "?client_id=YOUR_KAKAO_REST_KEY"
@@ -415,7 +364,7 @@ def social_login(provider: str = Query(...)):
 
 @app.get("/api/login/callback/{provider}")
 def oauth_callback(provider: str, code: str):
-    test_user_id = "remo_user_777"
-    test_email = "remo_user@gmail.com" if provider == "google" else "kakao_user@kakao.com"
+    test_user_id = "symphony_user_777"
+    test_email = "symphony_user@gmail.com" if provider == "google" else "kakao_user@kakao.com"
     app_deep_link_url = f"symphonyai://login_success?user_id={test_user_id}&email={test_email}"
     return RedirectResponse(url=app_deep_link_url)
