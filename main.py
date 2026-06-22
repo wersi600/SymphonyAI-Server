@@ -120,6 +120,7 @@ def call_hf_extract_midi(file_path: str):
                 "accompaniment_midi_url": "",
                 "vocal_url": "",
                 "accompaniment_url": "",
+                "mp3_url": "",
                 "bar_lines_ms": [],
                 "bpm": 0.0,
                 "bar_offset_ms": 0
@@ -134,6 +135,7 @@ def call_hf_extract_midi(file_path: str):
             "accompaniment_midi_url": normalize_hf_url(data.get("accompaniment_midi_url", "")),
             "vocal_url": normalize_hf_url(data.get("vocal_url", "")),
             "accompaniment_url": normalize_hf_url(data.get("accompaniment_url", "")),
+            "mp3_url": normalize_hf_url(data.get("mp3_url", "")),
             "bar_lines_ms": data.get("bar_lines_ms", []),
             "bpm": float(data.get("bpm", 0.0) or 0.0),
             "bar_offset_ms": int(data.get("bar_offset_ms", 0) or 0)
@@ -147,6 +149,7 @@ def call_hf_extract_midi(file_path: str):
             "accompaniment_midi_url": "",
             "vocal_url": "",
             "accompaniment_url": "",
+            "mp3_url": "",
             "bar_lines_ms": [],
             "bpm": 0.0,
             "bar_offset_ms": 0
@@ -183,6 +186,7 @@ def analyze_job(job_id: str):
             job["accompaniment_midi_url"] = midi_result.get("accompaniment_midi_url", "")
             job["vocal_url"] = midi_result.get("vocal_url", "")
             job["accompaniment_url"] = midi_result.get("accompaniment_url", "")
+            job["mp3_url"] = midi_result.get("mp3_url", "")
             job["bpm"] = bpm if bpm > 0 else 120.0
             job["bar_lines_ms"] = midi_result.get("bar_lines_ms", []) or fake_bar_lines_ms(duration_ms, job["bpm"])
         else:
@@ -191,6 +195,7 @@ def analyze_job(job_id: str):
             job["accompaniment_midi_url"] = ""
             job["vocal_url"] = ""
             job["accompaniment_url"] = ""
+            job["mp3_url"] = ""
             job["bpm"] = 120.0
             job["bar_lines_ms"] = fake_bar_lines_ms(duration_ms, bpm=120.0)
 
@@ -247,6 +252,7 @@ async def upload_audio_file(
         "bpm": 0.0,
         "vocal_url": "",
         "accompaniment_url": "",
+        "mp3_url": "",
         "midi_url": "",
         "melody_midi_url": "",
         "accompaniment_midi_url": "",
@@ -292,6 +298,7 @@ def job_status(job_id: str = Query(...)):
         "bpm": job["bpm"],
         "vocal_url": job["vocal_url"],
         "accompaniment_url": job["accompaniment_url"],
+        "mp3_url": job.get("mp3_url", ""),
         "midi_url": job["midi_url"],
         "melody_midi_url": job.get("melody_midi_url", ""),
         "accompaniment_midi_url": job.get("accompaniment_midi_url", ""),
