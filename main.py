@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile
+from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile, Body
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import os
@@ -308,6 +308,38 @@ def job_status(job_id: str = Query(...)):
         "stem_status": job.get("stem_status", ""),
         "stem_message": job.get("stem_message", "")
     }
+
+
+@app.post("/api/project/render")
+def render_project_artifact(payload: dict = Body(...)):
+    """저장된 프로젝트 상태를 HF Worker에서 WAV/MP3로 렌더링하고 다운로드 URL을 반환합니다."""
+    try:
+        response = requests.post(
+            f"{HF_WORKER_URL}/render-project",
+            headers={**hf_headers(), "Content-Type": "application/json"},
+            json=payload,
+            timeout=1200
+        )
+
+        if response.status_code != 200:
+            return {
+                "status": "failed",
+                "message": f"HF 렌더링 오류 {response.status_code}: {response.text[:800]}",
+                "download_url": ""
+            }
+
+        data = response.json()
+        return {
+            "status": data.get("status", "failed"),
+            "message": data.get("message", ""),
+            "download_url": normalize_hf_url(data.get("download_url", ""))
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "message": f"프로젝트 렌더링 호출 오류: {type(e).__name__} / {str(e)}",
+            "download_url": ""
+        }
 
 
 @app.post("/api/convert")
