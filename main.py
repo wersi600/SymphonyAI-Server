@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile, Body
+from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import os
@@ -43,7 +43,46 @@ def hf_headers():
     return {}
 
 
+def safe_str(value, default=""):
+    if value is None:
+        return default
+    text = str(value)
+    if text.lower() in ("none", "null", "nan"):
+        return default
+    return text
+
+
+def safe_float(value, default=0.0):
+    try:
+        v = float(value)
+        if not np.isfinite(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def safe_bar_lines(value):
+    if not isinstance(value, list):
+        return []
+    bars = []
+    for v in value:
+        try:
+            bars.append(int(float(v)))
+        except Exception:
+            pass
+    return bars
+
+
 def normalize_hf_url(url: str):
+    url = safe_str(url, "")
     if not url:
         return ""
     if url.startswith("/"):
@@ -96,7 +135,7 @@ def fake_bar_lines_ms(duration_ms: int, bpm: float = 120.0, beats_per_bar: int =
 def call_hf_extract_midi(file_path: str):
     """
     HF /extract-midi 호출.
-    이제 HF는 full.mid, melody.mid, midi_accompaniment.mid를 같이 반환합니다.
+    BasicPitch와 YourMT3 성공 응답을 같은 구조로 정규화합니다.
     """
     try:
         midi_url = f"{HF_WORKER_URL}/extract-midi"
@@ -108,13 +147,14 @@ def call_hf_extract_midi(file_path: str):
                 midi_url,
                 headers=hf_headers(),
                 files=files,
-                timeout=1200
+                timeout=1800
             )
 
         if response.status_code != 200:
             return {
                 "status": "failed",
                 "message": f"HF MIDI 오류 {response.status_code}: {response.text[:1000]}",
+                "job_id": "",
                 "midi_url": "",
                 "melody_midi_url": "",
                 "accompaniment_midi_url": "",
@@ -123,27 +163,72 @@ def call_hf_extract_midi(file_path: str):
                 "mp3_url": "",
                 "bar_lines_ms": [],
                 "bpm": 0.0,
-                "bar_offset_ms": 0
+                "midi_bpm": 0.0,
+                "bar_offset_ms": 0,
+                "midi_engine": "failed"
             }
 
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception as e:
+            return {
+                "status": "failed",
+                "message": f"HF JSON 파싱 오류: {type(e).__name__} / {response.text[:1000]}",
+                "job_id": "",
+                "midi_url": "",
+                "melody_midi_url": "",
+                "accompaniment_midi_url": "",
+                "vocal_url": "",
+                "accompaniment_url": "",
+                "mp3_url": "",
+                "bar_lines_ms": [],
+                "bpm": 0.0,
+                "midi_bpm": 0.0,
+                "bar_offset_ms": 0,
+                "midi_engine": "json_error"
+            }
+
+        # YourMT3/BasicPitch 모두 root 또는 data/result 중 하나에 결과가 올 수 있게 허용.
+        result = data.get("result") or data.get("data") or data
+
+        status = safe_str(data.get("status") or result.get("status"), "failed").lower()
+        message = safe_str(data.get("message") or result.get("message"), "")
+
+        full_url = normalize_hf_url(result.get("midi_url", ""))
+        melody_url = normalize_hf_url(result.get("melody_midi_url", ""))
+        acc_url = normalize_hf_url(result.get("accompaniment_midi_url", ""))
+
+        # YourMT3에서 full.mid만 확실히 나오고 melody/accompaniment가 비는 경우도 앱이 정상 처리하게 보정.
+        if not full_url:
+            full_url = melody_url or acc_url
+        if not melody_url:
+            melody_url = full_url
+        if not acc_url:
+            acc_url = full_url
+
+        success_like = status in ("success", "done", "completed", "complete") and bool(full_url)
+
         return {
-            "status": data.get("status", "failed"),
-            "message": data.get("message", ""),
-            "midi_url": normalize_hf_url(data.get("midi_url", "")),
-            "melody_midi_url": normalize_hf_url(data.get("melody_midi_url", "")),
-            "accompaniment_midi_url": normalize_hf_url(data.get("accompaniment_midi_url", "")),
-            "vocal_url": normalize_hf_url(data.get("vocal_url", "")),
-            "accompaniment_url": normalize_hf_url(data.get("accompaniment_url", "")),
-            "mp3_url": normalize_hf_url(data.get("mp3_url", "")),
-            "bar_lines_ms": data.get("bar_lines_ms", []),
-            "bpm": float(data.get("bpm", 0.0) or 0.0),
-            "bar_offset_ms": int(data.get("bar_offset_ms", 0) or 0)
+            "status": "success" if success_like else status,
+            "message": message or ("YourMT3/BasicPitch MIDI 생성 완료" if success_like else "MIDI 생성 실패"),
+            "job_id": safe_str(result.get("job_id", ""), ""),
+            "midi_url": full_url,
+            "melody_midi_url": melody_url,
+            "accompaniment_midi_url": acc_url,
+            "vocal_url": normalize_hf_url(result.get("vocal_url", "")),
+            "accompaniment_url": normalize_hf_url(result.get("accompaniment_url", "")),
+            "mp3_url": normalize_hf_url(result.get("mp3_url", "")),
+            "bar_lines_ms": safe_bar_lines(result.get("bar_lines_ms", [])),
+            "bpm": safe_float(result.get("bpm", 0.0), 0.0),
+            "midi_bpm": safe_float(result.get("midi_bpm", 0.0), 0.0),
+            "bar_offset_ms": safe_int(result.get("bar_offset_ms", 0), 0),
+            "midi_engine": safe_str(result.get("midi_engine", data.get("midi_engine", "")), "")
         }
     except Exception as e:
         return {
             "status": "failed",
             "message": f"MIDI 호출 예외: {type(e).__name__} / {str(e)}",
+            "job_id": "",
             "midi_url": "",
             "melody_midi_url": "",
             "accompaniment_midi_url": "",
@@ -152,8 +237,11 @@ def call_hf_extract_midi(file_path: str):
             "mp3_url": "",
             "bar_lines_ms": [],
             "bpm": 0.0,
-            "bar_offset_ms": 0
+            "midi_bpm": 0.0,
+            "bar_offset_ms": 0,
+            "midi_engine": "exception"
         }
+
 
 
 def analyze_job(job_id: str):
@@ -175,15 +263,19 @@ def analyze_job(job_id: str):
         job["debug_step"] = "split_midi"
         midi_result = call_hf_extract_midi(file_path)
 
-        job["midi_status"] = midi_result["status"]
-        job["midi_message"] = midi_result["message"]
+        job["midi_status"] = midi_result.get("status", "failed")
+        job["midi_message"] = midi_result.get("message", "")
+        job["midi_engine"] = midi_result.get("midi_engine", "")
         job["bar_offset_ms"] = midi_result.get("bar_offset_ms", 0)
 
-        if midi_result["status"] == "success" and midi_result.get("midi_url"):
+        if midi_result.get("status") == "success" and midi_result.get("midi_url"):
+
             bpm = float(midi_result.get("bpm", 0.0) or 0.0)
             job["midi_url"] = midi_result.get("midi_url", "")
             job["melody_midi_url"] = midi_result.get("melody_midi_url", "")
-            job["accompaniment_midi_url"] = midi_result.get("accompaniment_midi_url", "")
+            job["accompaniment_midi_url"] = midi_result.get("accompaniment_midi_url", "") or job["midi_url"]
+            if not job["melody_midi_url"]:
+                job["melody_midi_url"] = job["midi_url"]
             job["vocal_url"] = midi_result.get("vocal_url", "")
             job["accompaniment_url"] = midi_result.get("accompaniment_url", "")
             job["mp3_url"] = midi_result.get("mp3_url", "")
@@ -252,13 +344,14 @@ async def upload_audio_file(
         "bpm": 0.0,
         "vocal_url": "",
         "accompaniment_url": "",
-        "mp3_url": "",
         "midi_url": "",
+        "mp3_url": "",
         "melody_midi_url": "",
         "accompaniment_midi_url": "",
         "musicxml_url": "",
         "midi_status": "",
         "midi_message": "",
+        "midi_engine": "",
         "stem_status": "",
         "stem_message": ""
     }
@@ -284,62 +377,38 @@ def job_status(job_id: str = Query(...)):
         }
 
     job = jobs[job_id]
+    midi_url = job.get("midi_url", "") or job.get("melody_midi_url", "") or job.get("accompaniment_midi_url", "")
+    melody_midi_url = job.get("melody_midi_url", "") or midi_url
+    accompaniment_midi_url = job.get("accompaniment_midi_url", "") or midi_url
+    bpm = safe_float(job.get("bpm", 0.0), 120.0)
+    if bpm <= 0:
+        bpm = 120.0
+
     return {
-        "status": job["status"],
-        "message": job["message"],
+        "status": job.get("status", "failed"),
+        "message": job.get("message", ""),
         "debug_step": job.get("debug_step", ""),
         "job_id": job_id,
-        "file_name": job["file_name"],
-        "audio_url": job["audio_url"],
-        "duration_ms": job["duration_ms"],
-        "waveform_peaks": job["waveform_peaks"],
-        "bar_lines_ms": job["bar_lines_ms"],
-        "bar_offset_ms": job.get("bar_offset_ms", 0),
-        "bpm": job["bpm"],
-        "vocal_url": job["vocal_url"],
-        "accompaniment_url": job["accompaniment_url"],
-        "mp3_url": job.get("mp3_url", ""),
-        "midi_url": job["midi_url"],
-        "melody_midi_url": job.get("melody_midi_url", ""),
-        "accompaniment_midi_url": job.get("accompaniment_midi_url", ""),
-        "musicxml_url": job["musicxml_url"],
-        "midi_status": job.get("midi_status", ""),
-        "midi_message": job.get("midi_message", ""),
-        "stem_status": job.get("stem_status", ""),
-        "stem_message": job.get("stem_message", "")
+        "file_name": job.get("file_name", ""),
+        "audio_url": job.get("audio_url", ""),
+        "duration_ms": safe_int(job.get("duration_ms", 0), 0),
+        "waveform_peaks": job.get("waveform_peaks", []) or [],
+        "bar_lines_ms": job.get("bar_lines_ms", []) or fake_bar_lines_ms(safe_int(job.get("duration_ms", 0), 0), bpm),
+        "bar_offset_ms": safe_int(job.get("bar_offset_ms", 0), 0),
+        "bpm": bpm,
+        "vocal_url": job.get("vocal_url", "") or "",
+        "accompaniment_url": job.get("accompaniment_url", "") or "",
+        "mp3_url": job.get("mp3_url", "") or "",
+        "midi_url": midi_url or "",
+        "melody_midi_url": melody_midi_url or "",
+        "accompaniment_midi_url": accompaniment_midi_url or "",
+        "musicxml_url": job.get("musicxml_url", "") or "",
+        "midi_status": job.get("midi_status", "") or "",
+        "midi_message": job.get("midi_message", "") or "",
+        "midi_engine": job.get("midi_engine", "") or "",
+        "stem_status": job.get("stem_status", "") or "",
+        "stem_message": job.get("stem_message", "") or ""
     }
-
-
-@app.post("/api/project/render")
-def render_project_artifact(payload: dict = Body(...)):
-    """저장된 프로젝트 상태를 HF Worker에서 WAV/MP3로 렌더링하고 다운로드 URL을 반환합니다."""
-    try:
-        response = requests.post(
-            f"{HF_WORKER_URL}/render-project",
-            headers={**hf_headers(), "Content-Type": "application/json"},
-            json=payload,
-            timeout=1200
-        )
-
-        if response.status_code != 200:
-            return {
-                "status": "failed",
-                "message": f"HF 렌더링 오류 {response.status_code}: {response.text[:800]}",
-                "download_url": ""
-            }
-
-        data = response.json()
-        return {
-            "status": data.get("status", "failed"),
-            "message": data.get("message", ""),
-            "download_url": normalize_hf_url(data.get("download_url", ""))
-        }
-    except Exception as e:
-        return {
-            "status": "failed",
-            "message": f"프로젝트 렌더링 호출 오류: {type(e).__name__} / {str(e)}",
-            "download_url": ""
-        }
 
 
 @app.post("/api/convert")
