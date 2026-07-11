@@ -160,6 +160,10 @@ def call_hf_extract_midi(file_path: str):
                 "accompaniment_midi_url": "",
                 "vocal_url": "",
                 "accompaniment_url": "",
+                "bass_url": "",
+                "drums_url": "",
+                "other_url": "",
+                "stem_engine": "failed",
                 "mp3_url": "",
                 "bar_lines_ms": [],
                 "bpm": 0.0,
@@ -180,6 +184,10 @@ def call_hf_extract_midi(file_path: str):
                 "accompaniment_midi_url": "",
                 "vocal_url": "",
                 "accompaniment_url": "",
+                "bass_url": "",
+                "drums_url": "",
+                "other_url": "",
+                "stem_engine": "failed",
                 "mp3_url": "",
                 "bar_lines_ms": [],
                 "bpm": 0.0,
@@ -217,6 +225,10 @@ def call_hf_extract_midi(file_path: str):
             "accompaniment_midi_url": acc_url,
             "vocal_url": normalize_hf_url(result.get("vocal_url", "")),
             "accompaniment_url": normalize_hf_url(result.get("accompaniment_url", "")),
+            "bass_url": normalize_hf_url(result.get("bass_url", "")),
+            "drums_url": normalize_hf_url(result.get("drums_url", "")),
+            "other_url": normalize_hf_url(result.get("other_url", "")),
+            "stem_engine": safe_str(result.get("stem_engine", ""), ""),
             "mp3_url": normalize_hf_url(result.get("mp3_url", "")),
             "bar_lines_ms": safe_bar_lines(result.get("bar_lines_ms", [])),
             "bpm": safe_float(result.get("bpm", 0.0), 0.0),
@@ -234,6 +246,10 @@ def call_hf_extract_midi(file_path: str):
             "accompaniment_midi_url": "",
             "vocal_url": "",
             "accompaniment_url": "",
+            "bass_url": "",
+            "drums_url": "",
+            "other_url": "",
+            "stem_engine": "failed",
             "mp3_url": "",
             "bar_lines_ms": [],
             "bpm": 0.0,
@@ -278,6 +294,10 @@ def analyze_job(job_id: str):
                 job["melody_midi_url"] = job["midi_url"]
             job["vocal_url"] = midi_result.get("vocal_url", "")
             job["accompaniment_url"] = midi_result.get("accompaniment_url", "")
+            job["bass_url"] = midi_result.get("bass_url", "")
+            job["drums_url"] = midi_result.get("drums_url", "")
+            job["other_url"] = midi_result.get("other_url", "")
+            job["stem_engine"] = midi_result.get("stem_engine", "")
             job["mp3_url"] = midi_result.get("mp3_url", "")
             job["bpm"] = bpm if bpm > 0 else 120.0
             job["bar_lines_ms"] = midi_result.get("bar_lines_ms", []) or fake_bar_lines_ms(duration_ms, job["bpm"])
@@ -287,6 +307,10 @@ def analyze_job(job_id: str):
             job["accompaniment_midi_url"] = ""
             job["vocal_url"] = ""
             job["accompaniment_url"] = ""
+            job["bass_url"] = ""
+            job["drums_url"] = ""
+            job["other_url"] = ""
+            job["stem_engine"] = "failed"
             job["mp3_url"] = ""
             job["bpm"] = 120.0
             job["bar_lines_ms"] = fake_bar_lines_ms(duration_ms, bpm=120.0)
@@ -294,14 +318,15 @@ def analyze_job(job_id: str):
         # HF /extract-midi에서 stem wav도 같이 반환하므로 별도 /separate-stems 재호출은 하지 않습니다.
         if job["vocal_url"] and job["accompaniment_url"]:
             job["stem_status"] = "success"
-            job["stem_message"] = "MIDI 추출 단계에서 Stem URL 함께 생성됨"
+            engine = job.get("stem_engine", "unknown")
+            job["stem_message"] = f"Stem 생성 완료 ({engine})"
         else:
             job["stem_status"] = "failed"
             job["stem_message"] = "Stem URL 없음"
 
         job["status"] = "done"
         job["debug_step"] = "done"
-        job["message"] = "분석 완료 / 원곡·주멜로디·반주 MIDI 준비 완료"
+        job["message"] = "분석 완료 / Demucs 4Stem·원곡·주멜로디·반주 MIDI 준비 완료"
 
     except Exception as e:
         logger.error(f"비동기 태스크 내부 치명적 에러: {type(e).__name__} / {str(e)}")
@@ -344,6 +369,10 @@ async def upload_audio_file(
         "bpm": 0.0,
         "vocal_url": "",
         "accompaniment_url": "",
+        "bass_url": "",
+        "drums_url": "",
+        "other_url": "",
+        "stem_engine": "",
         "midi_url": "",
         "mp3_url": "",
         "melody_midi_url": "",
@@ -398,6 +427,10 @@ def job_status(job_id: str = Query(...)):
         "bpm": bpm,
         "vocal_url": job.get("vocal_url", "") or "",
         "accompaniment_url": job.get("accompaniment_url", "") or "",
+        "bass_url": job.get("bass_url", "") or "",
+        "drums_url": job.get("drums_url", "") or "",
+        "other_url": job.get("other_url", "") or "",
+        "stem_engine": job.get("stem_engine", "") or "",
         "mp3_url": job.get("mp3_url", "") or "",
         "midi_url": midi_url or "",
         "melody_midi_url": melody_midi_url or "",
