@@ -132,7 +132,7 @@ def fake_bar_lines_ms(duration_ms: int, bpm: float = 120.0, beats_per_bar: int =
     return lines
 
 
-def call_hf_extract_midi(file_path: str):
+def call_hf_extract_midi(file_path: str, cached_stems: dict = None):
     """
     HF /extract-midi 호출.
     BasicPitch와 YourMT3 성공 응답을 같은 구조로 정규화합니다.
@@ -141,12 +141,24 @@ def call_hf_extract_midi(file_path: str):
         midi_url = f"{HF_WORKER_URL}/extract-midi"
         logger.info(f"HF 분리 MIDI 추출 요청: {midi_url}")
 
+        cached_stems = cached_stems or {}
+        form_data = {
+            "vocal_url": safe_str(cached_stems.get("vocal_url", ""), ""),
+            "accompaniment_url": safe_str(cached_stems.get("accompaniment_url", ""), ""),
+            "bass_url": safe_str(cached_stems.get("bass_url", ""), ""),
+            "drums_url": safe_str(cached_stems.get("drums_url", ""), ""),
+            "other_url": safe_str(cached_stems.get("other_url", ""), ""),
+        }
+        cache_ready = all(form_data.get(key) for key in ("vocal_url", "bass_url", "drums_url", "other_url"))
+        logger.info(f"HF MIDI 요청 / stem_cache={'hit' if cache_ready else 'miss'}")
+
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
             response = requests.post(
                 midi_url,
                 headers=hf_headers(),
                 files=files,
+                data=form_data,
                 timeout=1800
             )
 
@@ -221,6 +233,7 @@ def call_hf_extract_midi(file_path: str):
             "message": message or ("YourMT3/BasicPitch MIDI 생성 완료" if success_like else "MIDI 생성 실패"),
             "job_id": safe_str(result.get("job_id", ""), ""),
             "midi_url": full_url,
+            "raw_yourmt3_midi_url": normalize_hf_url(result.get("raw_yourmt3_midi_url", "")),
             "melody_midi_url": melody_url,
             "accompaniment_midi_url": acc_url,
             "vocal_url": normalize_hf_url(result.get("vocal_url", "")),
@@ -258,6 +271,118 @@ def call_hf_extract_midi(file_path: str):
             "midi_engine": "exception"
         }
 
+
+
+
+def call_hf_separate_stems(file_path: str):
+    """HF Demucs-only endpoint. No MIDI work is started."""
+    try:
+        url = f"{HF_WORKER_URL}/separate-stems"
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+            response = requests.post(url, headers=hf_headers(), files=files, timeout=1800)
+        if response.status_code != 200:
+            return {"status": "failed", "message": f"HF Stem 오류 {response.status_code}: {response.text[:800]}"}
+        data = response.json()
+        result = data.get("result") or data.get("data") or data
+        status = safe_str(data.get("status") or result.get("status"), "failed").lower()
+        return {
+            "status": "success" if status in ("success", "done", "completed", "complete") else status,
+            "message": safe_str(data.get("message") or result.get("message"), ""),
+            "vocal_url": normalize_hf_url(result.get("vocal_url", "")),
+            "accompaniment_url": normalize_hf_url(result.get("accompaniment_url", "")),
+            "bass_url": normalize_hf_url(result.get("bass_url", "")),
+            "drums_url": normalize_hf_url(result.get("drums_url", "")),
+            "other_url": normalize_hf_url(result.get("other_url", "")),
+            "stem_engine": safe_str(result.get("stem_engine", ""), ""),
+        }
+    except Exception as e:
+        return {"status": "failed", "message": f"Stem 호출 예외: {type(e).__name__} / {e}"}
+
+
+def prepare_uploaded_job(job_id: str):
+    """Upload only: prepare waveform and duration, without Demucs or MIDI."""
+    try:
+        job = jobs[job_id]
+        job["status"] = "processing"
+        job["message"] = "원곡을 준비하고 있습니다."
+        job["debug_step"] = "waveform"
+        audio = AudioSegment.from_file(job["file_path"])
+        job["duration_ms"] = len(audio)
+        job["waveform_peaks"] = make_waveform_peaks(job["file_path"], target_peaks=12000)
+        job["bpm"] = 120.0
+        job["bar_lines_ms"] = []
+        job["status"] = "done"
+        job["message"] = "원곡 준비 완료. 필요한 분석을 선택하세요."
+        job["debug_step"] = "source_ready"
+    except Exception as e:
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["message"] = f"원곡 준비 오류: {type(e).__name__} / {e}"
+        jobs[job_id]["debug_step"] = "error"
+
+
+def run_stem_job(job_id: str):
+    job = jobs[job_id]
+    try:
+        job["status"] = "processing"
+        job["message"] = "Demucs 4Stem 분리 중입니다."
+        job["debug_step"] = "stems"
+        result = call_hf_separate_stems(job["file_path"])
+        if result.get("status") != "success":
+            raise RuntimeError(result.get("message") or "Stem 분리 실패")
+        for key in ("vocal_url", "accompaniment_url", "bass_url", "drums_url", "other_url", "stem_engine"):
+            job[key] = result.get(key, "")
+        job["stem_status"] = "success"
+        job["stem_message"] = result.get("message") or "Demucs 4Stem 분리 완료"
+        job["status"] = "done"
+        job["message"] = "스템 분리 완료"
+        job["debug_step"] = "stems_done"
+    except Exception as e:
+        job["stem_status"] = "failed"
+        job["stem_message"] = str(e)
+        job["status"] = "failed"
+        job["message"] = f"스템 분리 실패: {e}"
+        job["debug_step"] = "stems_error"
+
+
+def run_midi_job(job_id: str):
+    job = jobs[job_id]
+    try:
+        job["status"] = "processing"
+        job["message"] = "Official YourMT3+ MIDI 변환 중입니다."
+        job["debug_step"] = "midi"
+        cached_stems = {
+            "vocal_url": job.get("vocal_url", ""),
+            "accompaniment_url": job.get("accompaniment_url", ""),
+            "bass_url": job.get("bass_url", ""),
+            "drums_url": job.get("drums_url", ""),
+            "other_url": job.get("other_url", ""),
+        }
+        result = call_hf_extract_midi(job["file_path"], cached_stems=cached_stems)
+        if result.get("status") != "success" or not result.get("midi_url"):
+            raise RuntimeError(result.get("message") or "MIDI 변환 실패")
+        for key in (
+            "midi_url", "melody_midi_url", "accompaniment_midi_url", "vocal_url",
+            "accompaniment_url", "bass_url", "drums_url", "other_url", "stem_engine",
+            "mp3_url", "bar_lines_ms", "bpm", "midi_engine", "bar_offset_ms",
+            "raw_yourmt3_midi_url"
+        ):
+            if key in result and result.get(key) not in (None, ""):
+                job[key] = result.get(key)
+        job["midi_status"] = "success"
+        job["midi_message"] = result.get("message") or "MIDI 변환 완료"
+        if job.get("vocal_url") and job.get("accompaniment_url"):
+            job["stem_status"] = "success"
+            job["stem_message"] = "MIDI 변환 과정에서 4Stem도 준비되었습니다."
+        job["status"] = "done"
+        job["message"] = "MIDI 변환 완료"
+        job["debug_step"] = "midi_done"
+    except Exception as e:
+        job["midi_status"] = "failed"
+        job["midi_message"] = str(e)
+        job["status"] = "failed"
+        job["message"] = f"MIDI 변환 실패: {e}"
+        job["debug_step"] = "midi_error"
 
 
 def analyze_job(job_id: str):
@@ -374,6 +499,7 @@ async def upload_audio_file(
         "other_url": "",
         "stem_engine": "",
         "midi_url": "",
+        "raw_yourmt3_midi_url": "",
         "mp3_url": "",
         "melody_midi_url": "",
         "accompaniment_midi_url": "",
@@ -385,12 +511,12 @@ async def upload_audio_file(
         "stem_message": ""
     }
 
-    background_tasks.add_task(analyze_job, job_id)
+    background_tasks.add_task(prepare_uploaded_job, job_id)
 
     return {
         "status": "success",
         "job_id": job_id,
-        "message": "업로드 완료. 분석을 시작합니다.",
+        "message": "업로드 완료. 원곡을 준비합니다.",
         "audio_url": full_audio_url,
         "file_name": clean_filename
     }
@@ -433,6 +559,7 @@ def job_status(job_id: str = Query(...)):
         "stem_engine": job.get("stem_engine", "") or "",
         "mp3_url": job.get("mp3_url", "") or "",
         "midi_url": midi_url or "",
+        "raw_yourmt3_midi_url": job.get("raw_yourmt3_midi_url", "") or "",
         "melody_midi_url": melody_midi_url or "",
         "accompaniment_midi_url": accompaniment_midi_url or "",
         "musicxml_url": job.get("musicxml_url", "") or "",
@@ -440,9 +567,37 @@ def job_status(job_id: str = Query(...)):
         "midi_message": job.get("midi_message", "") or "",
         "midi_engine": job.get("midi_engine", "") or "",
         "stem_status": job.get("stem_status", "") or "",
-        "stem_message": job.get("stem_message", "") or ""
+        "stem_message": job.get("stem_message", "") or "",
+        "stem_cache_ready": bool(job.get("vocal_url") and job.get("bass_url") and job.get("drums_url") and job.get("other_url"))
     }
 
+
+
+
+@app.post("/api/job/stems")
+async def start_stem_analysis(background_tasks: BackgroundTasks, payload: dict = Body(...)):
+    job_id = safe_str(payload.get("job_id"), "")
+    if not job_id or job_id not in jobs:
+        return {"status": "failed", "message": "유효한 작업을 찾지 못했습니다."}
+    if jobs[job_id].get("status") == "processing":
+        return {"status": "failed", "message": "다른 작업이 진행 중입니다."}
+    jobs[job_id]["status"] = "processing"
+    jobs[job_id]["message"] = "스템 분리 요청을 받았습니다."
+    background_tasks.add_task(run_stem_job, job_id)
+    return {"status": "accepted", "job_id": job_id, "message": "Demucs 4Stem 분리를 시작합니다."}
+
+
+@app.post("/api/job/midi")
+async def start_midi_analysis(background_tasks: BackgroundTasks, payload: dict = Body(...)):
+    job_id = safe_str(payload.get("job_id"), "")
+    if not job_id or job_id not in jobs:
+        return {"status": "failed", "message": "유효한 작업을 찾지 못했습니다."}
+    if jobs[job_id].get("status") == "processing":
+        return {"status": "failed", "message": "다른 작업이 진행 중입니다."}
+    jobs[job_id]["status"] = "processing"
+    jobs[job_id]["message"] = "MIDI 변환 요청을 받았습니다."
+    background_tasks.add_task(run_midi_job, job_id)
+    return {"status": "accepted", "job_id": job_id, "message": "Official YourMT3+ MIDI 변환을 시작합니다."}
 
 
 @app.post("/api/project/render")
