@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile
+from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile, Body
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import os
@@ -443,6 +443,55 @@ def job_status(job_id: str = Query(...)):
         "stem_message": job.get("stem_message", "") or ""
     }
 
+
+
+@app.post("/api/project/render")
+def render_project_artifact(payload: dict = Body(...)):
+    """Android 라이브러리/다운로드 요청을 HF Worker로 안전하게 프록시합니다."""
+    try:
+        response = requests.post(
+            f"{HF_WORKER_URL}/render-project",
+            headers={**hf_headers(), "Content-Type": "application/json"},
+            json=payload,
+            timeout=1200
+        )
+        if response.status_code != 200:
+            logger.error(f"HF /render-project failed: {response.status_code} / {response.text[:1000]}")
+            return {
+                "status": "failed",
+                "message": f"HF 렌더링 오류 {response.status_code}: {response.text[:500]}",
+                "download_url": ""
+            }
+        try:
+            data = response.json()
+        except Exception as e:
+            logger.error(f"HF render JSON parse failed: {type(e).__name__} / {response.text[:1000]}")
+            return {
+                "status": "failed",
+                "message": f"HF 렌더링 응답 해석 실패: {type(e).__name__}",
+                "download_url": ""
+            }
+        raw_url = safe_str(data.get("download_url", ""), "")
+        download_url = normalize_hf_url(raw_url)
+        status = safe_str(data.get("status", "failed"), "failed").lower()
+        if status == "success" and download_url:
+            return {
+                "status": "success",
+                "message": safe_str(data.get("message", "프로젝트 렌더링 완료"), "프로젝트 렌더링 완료"),
+                "download_url": download_url
+            }
+        return {
+            "status": "failed",
+            "message": safe_str(data.get("message", "HF 렌더링 결과 URL이 없습니다."), "HF 렌더링 결과 URL이 없습니다."),
+            "download_url": ""
+        }
+    except Exception as e:
+        logger.error(f"project render proxy exception: {type(e).__name__} / {str(e)}")
+        return {
+            "status": "failed",
+            "message": f"프로젝트 렌더링 호출 오류: {type(e).__name__} / {str(e)}",
+            "download_url": ""
+        }
 
 @app.post("/api/convert")
 def convert_music(
