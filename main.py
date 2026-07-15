@@ -604,6 +604,14 @@ async def start_midi_analysis(background_tasks: BackgroundTasks, payload: dict =
 def render_project_artifact(payload: dict = Body(...)):
     """Android 라이브러리/다운로드 요청을 HF Worker로 안전하게 프록시합니다."""
     try:
+        logger.info(
+            "Project render request / "
+            f"stem_mixer={bool(payload.get('stem_mixer_enabled', False))} / "
+            f"vocal_vol={payload.get('vocal_stem_volume', 1.0)} / "
+            f"bass_vol={payload.get('bass_stem_volume', 1.0)} / "
+            f"drums_vol={payload.get('drums_stem_volume', 1.0)} / "
+            f"other_vol={payload.get('other_stem_volume', 1.0)}"
+        )
         response = requests.post(
             f"{HF_WORKER_URL}/render-project",
             headers={**hf_headers(), "Content-Type": "application/json"},
