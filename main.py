@@ -610,7 +610,9 @@ def render_project_artifact(payload: dict = Body(...)):
             f"vocal_vol={payload.get('vocal_stem_volume', 1.0)} / "
             f"bass_vol={payload.get('bass_stem_volume', 1.0)} / "
             f"drums_vol={payload.get('drums_stem_volume', 1.0)} / "
-            f"other_vol={payload.get('other_stem_volume', 1.0)}"
+            f"other_vol={payload.get('other_stem_volume', 1.0)} / "
+            f"key_shift={payload.get('key_shift', 0)} / "
+            "audio_drums_key=0 / midi_drums_key=0"
         )
         response = requests.post(
             f"{HF_WORKER_URL}/render-project",
