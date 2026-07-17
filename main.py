@@ -427,8 +427,56 @@ def run_midi_job(job_id: str):
         if job.get("vocal_url") and job.get("accompaniment_url"):
             job["stem_status"] = "success"
             job["stem_message"] = "MIDI 변환 과정에서 4Stem도 준비되었습니다."
+
+        # The normal MIDI button must also create the three diagnostic Stem MIDI files.
+        # Previously only /api/job/stem-midi did this, so Android buttons had blank URLs.
+        job["message"] = "Bass/Drums/Other 개별 MIDI 생성 중입니다."
+        job["debug_step"] = "midi_stem_diagnostics"
+        stem_result = call_hf_extract_stem_midi(
+            job["file_path"],
+            {
+                "vocal_url": job.get("vocal_url", ""),
+                "accompaniment_url": job.get("accompaniment_url", ""),
+                "bass_url": job.get("bass_url", ""),
+                "drums_url": job.get("drums_url", ""),
+                "other_url": job.get("other_url", ""),
+            },
+        )
+        if stem_result.get("status") != "success":
+            raise RuntimeError(
+                stem_result.get("message") or "Bass/Drums/Other 개별 MIDI 생성 실패"
+            )
+
+        required_stem_urls = {
+            "bass_raw_midi_url": stem_result.get("bass_raw_midi_url") or stem_result.get("bass_midi_url"),
+            "drums_raw_midi_url": stem_result.get("drums_raw_midi_url") or stem_result.get("drums_midi_url"),
+            "other_raw_midi_url": stem_result.get("other_raw_midi_url") or stem_result.get("other_midi_url"),
+        }
+        missing = [key for key, value in required_stem_urls.items() if not value]
+        if missing:
+            raise RuntimeError("개별 MIDI URL 누락: " + ", ".join(missing))
+
+        for key in (
+            "stem_midi_url", "stem_full_midi_url",
+            "bass_raw_midi_url", "drums_raw_midi_url", "other_raw_midi_url",
+            "bass_midi_url", "drums_midi_url", "other_midi_url",
+            "stem_debug_json_url",
+        ):
+            value = stem_result.get(key)
+            if value not in (None, ""):
+                job[key] = value
+
+        print(
+            "[REMO STEM MIDI URL] "
+            f"bass={job.get('bass_raw_midi_url', '')} / "
+            f"drums={job.get('drums_raw_midi_url', '')} / "
+            f"other={job.get('other_raw_midi_url', '')}"
+        )
+
+        job["stem_midi_status"] = "success"
+        job["stem_midi_message"] = stem_result.get("message") or "개별 Stem MIDI 생성 완료"
         job["status"] = "done"
-        job["message"] = "MIDI 변환 완료"
+        job["message"] = "MIDI 및 Bass/Drums/Other 개별 MIDI 생성 완료"
         job["debug_step"] = "midi_done"
     except Exception as e:
         job["midi_status"] = "failed"
