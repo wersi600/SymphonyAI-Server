@@ -274,59 +274,6 @@ def call_hf_extract_midi(file_path: str, cached_stems: dict = None):
 
 
 
-def call_hf_extract_stem_midi(file_path: str, cached_stems: dict = None):
-    try:
-        cached_stems = cached_stems or {}
-        form_data = {
-            "vocal_url": safe_str(cached_stems.get("vocal_url", ""), ""),
-            "accompaniment_url": safe_str(cached_stems.get("accompaniment_url", ""), ""),
-            "bass_url": safe_str(cached_stems.get("bass_url", ""), ""),
-            "drums_url": safe_str(cached_stems.get("drums_url", ""), ""),
-            "other_url": safe_str(cached_stems.get("other_url", ""), ""),
-        }
-        with open(file_path, "rb") as file_handle:
-            response = requests.post(
-                f"{HF_WORKER_URL}/extract-midi-stems",
-                headers=hf_headers(),
-                files={"file": (os.path.basename(file_path), file_handle, "audio/mpeg")},
-                data=form_data,
-                timeout=3600,
-            )
-        if response.status_code != 200:
-            return {
-                "status": "failed",
-                "message": f"HF Stem MIDI 오류 {response.status_code}: {response.text[:1000]}",
-            }
-        data = response.json()
-        result = data.get("result") or data.get("data") or data
-        status = safe_str(data.get("status") or result.get("status"), "failed").lower()
-        return {
-            "status": "success" if status in ("success", "done", "completed", "complete") else status,
-            "message": safe_str(data.get("message") or result.get("message"), ""),
-            "stem_midi_url": normalize_hf_url(result.get("stem_midi_url") or result.get("midi_url", "")),
-            "bass_raw_midi_url": normalize_hf_url(result.get("bass_raw_midi_url") or result.get("bass_midi_url", "")),
-            "drums_raw_midi_url": normalize_hf_url(result.get("drums_raw_midi_url") or result.get("drums_midi_url", "")),
-            "other_raw_midi_url": normalize_hf_url(result.get("other_raw_midi_url") or result.get("other_midi_url", "")),
-            "bass_midi_url": normalize_hf_url(result.get("bass_midi_url") or result.get("bass_raw_midi_url", "")),
-            "drums_midi_url": normalize_hf_url(result.get("drums_midi_url") or result.get("drums_raw_midi_url", "")),
-            "other_midi_url": normalize_hf_url(result.get("other_midi_url") or result.get("other_raw_midi_url", "")),
-            "stem_full_midi_url": normalize_hf_url(result.get("stem_full_midi_url") or result.get("stem_midi_url") or result.get("midi_url", "")),
-            "stem_debug_json_url": normalize_hf_url(result.get("stem_debug_json_url", "")),
-            "vocal_url": normalize_hf_url(result.get("vocal_url", "")),
-            "accompaniment_url": normalize_hf_url(result.get("accompaniment_url", "")),
-            "bass_url": normalize_hf_url(result.get("bass_url", "")),
-            "drums_url": normalize_hf_url(result.get("drums_url", "")),
-            "other_url": normalize_hf_url(result.get("other_url", "")),
-            "stem_engine": safe_str(result.get("stem_engine", ""), ""),
-            "midi_engine": safe_str(result.get("midi_engine", ""), ""),
-        }
-    except Exception as e:
-        return {
-            "status": "failed",
-            "message": f"Stem MIDI 호출 예외: {type(e).__name__} / {e}",
-        }
-
-
 def call_hf_separate_stems(file_path: str):
     """HF Demucs-only endpoint. No MIDI work is started."""
     try:
@@ -436,50 +383,6 @@ def run_midi_job(job_id: str):
         job["status"] = "failed"
         job["message"] = f"MIDI 변환 실패: {e}"
         job["debug_step"] = "midi_error"
-
-
-def run_stem_midi_job(job_id: str):
-    job = jobs[job_id]
-    try:
-        job["status"] = "processing"
-        job["message"] = "Stem별 Official YourMT3+ 3회 변환 중입니다."
-        job["debug_step"] = "stem_midi"
-
-        result = call_hf_extract_stem_midi(
-            job["file_path"],
-            {
-                "vocal_url": job.get("vocal_url", ""),
-                "accompaniment_url": job.get("accompaniment_url", ""),
-                "bass_url": job.get("bass_url", ""),
-                "drums_url": job.get("drums_url", ""),
-                "other_url": job.get("other_url", ""),
-            },
-        )
-        if result.get("status") != "success" or not result.get("stem_midi_url"):
-            raise RuntimeError(result.get("message") or "Stem MIDI 실험 실패")
-
-        for key in (
-            "stem_midi_url", "stem_full_midi_url",
-            "bass_raw_midi_url", "drums_raw_midi_url", "other_raw_midi_url",
-            "bass_midi_url", "drums_midi_url", "other_midi_url",
-            "stem_debug_json_url", "vocal_url",
-            "accompaniment_url", "bass_url", "drums_url", "other_url",
-            "stem_engine", "midi_engine",
-        ):
-            if result.get(key) not in (None, ""):
-                job[key] = result.get(key)
-
-        job["stem_midi_status"] = "success"
-        job["stem_midi_message"] = result.get("message") or "Stem MIDI 실험 완료"
-        job["status"] = "done"
-        job["message"] = "Stem MIDI 실험 완료"
-        job["debug_step"] = "stem_midi_done"
-    except Exception as e:
-        job["stem_midi_status"] = "failed"
-        job["stem_midi_message"] = str(e)
-        job["status"] = "failed"
-        job["message"] = f"Stem MIDI 실험 실패: {e}"
-        job["debug_step"] = "stem_midi_error"
 
 
 def analyze_job(job_id: str):
@@ -657,17 +560,6 @@ def job_status(job_id: str = Query(...)):
         "mp3_url": job.get("mp3_url", "") or "",
         "midi_url": midi_url or "",
         "raw_yourmt3_midi_url": job.get("raw_yourmt3_midi_url", "") or "",
-        "stem_midi_url": job.get("stem_midi_url", "") or "",
-        "bass_raw_midi_url": job.get("bass_raw_midi_url", "") or job.get("bass_midi_url", "") or "",
-        "drums_raw_midi_url": job.get("drums_raw_midi_url", "") or job.get("drums_midi_url", "") or "",
-        "other_raw_midi_url": job.get("other_raw_midi_url", "") or job.get("other_midi_url", "") or "",
-        "bass_midi_url": job.get("bass_midi_url", "") or job.get("bass_raw_midi_url", "") or "",
-        "drums_midi_url": job.get("drums_midi_url", "") or job.get("drums_raw_midi_url", "") or "",
-        "other_midi_url": job.get("other_midi_url", "") or job.get("other_raw_midi_url", "") or "",
-        "stem_full_midi_url": job.get("stem_full_midi_url", "") or job.get("stem_midi_url", "") or job.get("midi_url", "") or "",
-        "stem_debug_json_url": job.get("stem_debug_json_url", "") or "",
-        "stem_midi_status": job.get("stem_midi_status", "") or "",
-        "stem_midi_message": job.get("stem_midi_message", "") or "",
         "melody_midi_url": melody_midi_url or "",
         "accompaniment_midi_url": accompaniment_midi_url or "",
         "musicxml_url": job.get("musicxml_url", "") or "",
@@ -706,24 +598,6 @@ async def start_midi_analysis(background_tasks: BackgroundTasks, payload: dict =
     jobs[job_id]["message"] = "MIDI 변환 요청을 받았습니다."
     background_tasks.add_task(run_midi_job, job_id)
     return {"status": "accepted", "job_id": job_id, "message": "Official YourMT3+ MIDI 변환을 시작합니다."}
-
-
-@app.post("/api/job/stem-midi")
-async def start_stem_midi_analysis(background_tasks: BackgroundTasks, payload: dict = Body(...)):
-    job_id = safe_str(payload.get("job_id"), "")
-    if not job_id or job_id not in jobs:
-        return {"status": "failed", "message": "유효한 작업을 찾지 못했습니다."}
-    if jobs[job_id].get("status") == "processing":
-        return {"status": "failed", "message": "다른 작업이 진행 중입니다."}
-
-    jobs[job_id]["status"] = "processing"
-    jobs[job_id]["message"] = "Stem MIDI 실험 요청을 받았습니다."
-    background_tasks.add_task(run_stem_midi_job, job_id)
-    return {
-        "status": "accepted",
-        "job_id": job_id,
-        "message": "Bass/Drums/Other Stem별 YourMT3 실험을 시작합니다.",
-    }
 
 
 @app.post("/api/project/render")
