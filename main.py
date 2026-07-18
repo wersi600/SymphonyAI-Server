@@ -221,8 +221,8 @@ def call_hf_extract_midi(file_path: str, cached_stems: dict = None):
         # YourMT3에서 full.mid만 확실히 나오고 melody/accompaniment가 비는 경우도 앱이 정상 처리하게 보정.
         if not full_url:
             full_url = melody_url or acc_url
-        if not melody_url:
-            melody_url = full_url
+        # 주멜로디는 vocals.wav -> BasicPitch -> melody.mid 결과만 허용합니다.
+        # 생성 실패 시 full MIDI로 대체하지 않습니다.
         if not acc_url:
             acc_url = full_url
 
@@ -415,8 +415,8 @@ def analyze_job(job_id: str):
             job["midi_url"] = midi_result.get("midi_url", "")
             job["melody_midi_url"] = midi_result.get("melody_midi_url", "")
             job["accompaniment_midi_url"] = midi_result.get("accompaniment_midi_url", "") or job["midi_url"]
-            if not job["melody_midi_url"]:
-                job["melody_midi_url"] = job["midi_url"]
+            # melody_midi_url이 비어 있으면 그대로 유지합니다.
+            # full MIDI를 주멜로디로 대체하지 않습니다.
             job["vocal_url"] = midi_result.get("vocal_url", "")
             job["accompaniment_url"] = midi_result.get("accompaniment_url", "")
             job["bass_url"] = midi_result.get("bass_url", "")
@@ -533,7 +533,7 @@ def job_status(job_id: str = Query(...)):
 
     job = jobs[job_id]
     midi_url = job.get("midi_url", "") or job.get("melody_midi_url", "") or job.get("accompaniment_midi_url", "")
-    melody_midi_url = job.get("melody_midi_url", "") or midi_url
+    melody_midi_url = job.get("melody_midi_url", "")
     accompaniment_midi_url = job.get("accompaniment_midi_url", "") or midi_url
     bpm = safe_float(job.get("bpm", 0.0), 120.0)
     if bpm <= 0:
