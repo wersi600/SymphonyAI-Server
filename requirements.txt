@@ -5,3 +5,5 @@ python-multipart
 pydub
 imageio-ffmpeg
 numpy
+boto3>=1.34
+psycopg[binary]>=3.2
