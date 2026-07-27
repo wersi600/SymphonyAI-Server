@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Query, BackgroundTasks, File, UploadFile, Body
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from ace_step_routes import router as ace_step_router
 import os
 import uuid
 import urllib.parse
@@ -24,6 +25,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("REMO-Backend")
 
 app = FastAPI()
+app.include_router(ace_step_router)
 
 BASE_URL = os.environ.get(
     "BASE_URL",
