@@ -1,195 +1,286 @@
+import json
 import os
-import threading
+import tempfile
 import time
 import uuid
-from urllib.parse import urljoin
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
+import boto3
+import psycopg
 import requests
+from botocore.config import Config
 from fastapi import APIRouter, BackgroundTasks, Body, Query
-
-from DatabaseService import DatabaseService
-from StorageService import StorageService
+from psycopg.rows import dict_row
 
 router = APIRouter(prefix="/api/ace-step", tags=["ACE-Step"])
 
 ACE_STEP_WORKER_URL = os.environ.get("ACE_STEP_WORKER_URL", "").rstrip("/")
 ACE_STEP_API_KEY = os.environ.get("ACE_STEP_API_KEY", "").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
+R2_ENDPOINT_URL = os.environ.get(
+    "R2_ENDPOINT_URL",
+    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else "",
+).strip()
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "").strip()
+
+# ACE-Step 1.5 official API defaults. Render environment variables can override them.
+ACE_STEP_MODEL = os.environ.get("ACE_STEP_MODEL", "acestep-v15-turbo").strip()
+ACE_STEP_LM_MODEL = os.environ.get("ACE_STEP_LM_MODEL", "acestep-5Hz-lm-0.6B").strip()
 ACE_STEP_POLL_SECONDS = max(2, int(os.environ.get("ACE_STEP_POLL_SECONDS", "5")))
 ACE_STEP_TIMEOUT_SECONDS = max(120, int(os.environ.get("ACE_STEP_TIMEOUT_SECONDS", "3600")))
-ACE_STEP_DEFAULT_DURATION = max(10.0, float(os.environ.get("ACE_STEP_DEFAULT_DURATION", "30")))
-ACE_STEP_MAX_DURATION = max(ACE_STEP_DEFAULT_DURATION, float(os.environ.get("ACE_STEP_MAX_DURATION", "180")))
-
-_db = DatabaseService()
-_storage = StorageService()
-_db_init_lock = threading.Lock()
-_db_initialized = False
 
 
-def _ensure_database() -> None:
-    global _db_initialized
-    if _db_initialized:
-        return
-    with _db_init_lock:
-        if not _db_initialized:
-            _db.initialize()
-            _db_initialized = True
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _worker_headers() -> dict:
-    headers = {"User-Agent": "REMO-AceStep/2.0"}
+def db_connect():
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def save_job(job: dict) -> None:
+    job["updated_at"] = utc_now_iso()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO remo_jobs(job_id, payload, created_at, updated_at)
+                VALUES (%s, %s::jsonb, NOW(), NOW())
+                ON CONFLICT (job_id)
+                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+                """,
+                (job["job_id"], json.dumps(job, ensure_ascii=False, default=str)),
+            )
+        conn.commit()
+
+
+def load_job(job_id: str):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM remo_jobs WHERE job_id = %s", (job_id,))
+            row = cur.fetchone()
+    if not row:
+        return None
+    payload = row["payload"]
+    return json.loads(payload) if isinstance(payload, str) else payload
+
+
+def r2_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def signed_url(storage_key: str, expires_seconds: int = 3600) -> str:
+    return r2_client().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": storage_key},
+        ExpiresIn=expires_seconds,
+    )
+
+
+def worker_headers(include_json: bool = False) -> dict:
+    headers = {"User-Agent": "REMO-AceStep/1.0"}
     if ACE_STEP_API_KEY:
         headers["Authorization"] = f"Bearer {ACE_STEP_API_KEY}"
+    if include_json:
+        headers["Content-Type"] = "application/json"
     return headers
 
 
-def _checked_json(response: requests.Response) -> dict:
+def checked_json(response: requests.Response) -> dict:
     response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError("ACE-Step Worker 응답이 JSON 객체가 아닙니다.")
-    return payload
+    data = response.json()
+    if isinstance(data, dict) and data.get("code") not in (None, 200):
+        raise RuntimeError(data.get("error") or f"ACE-Step API code={data.get('code')}")
+    return data
 
 
-def _safe_duration(value) -> float:
+def absolute_worker_url(path_or_url: str) -> str:
+    if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+        return path_or_url
+    return urljoin(f"{ACE_STEP_WORKER_URL}/", path_or_url.lstrip("/"))
+
+
+def persist_audio(job_id: str, remote_url: str) -> tuple[str, str, str]:
+    parsed_path = urlparse(remote_url).path
+    suffix = Path(parsed_path).suffix.lower() or ".mp3"
+    if suffix not in {".mp3", ".wav", ".flac", ".aac", ".opus", ".m4a"}:
+        suffix = ".mp3"
+
+    storage_key = f"projects/{job_id}/ace-step/master{suffix}"
+    fd, temp_path = tempfile.mkstemp(prefix="remo_ace_", suffix=suffix)
+    os.close(fd)
+    content_type = "audio/mpeg" if suffix == ".mp3" else "audio/wav"
+
     try:
-        duration = float(value)
-    except Exception:
-        duration = ACE_STEP_DEFAULT_DURATION
-    return max(10.0, min(ACE_STEP_MAX_DURATION, duration))
+        with requests.get(
+            remote_url,
+            headers=worker_headers(),
+            stream=True,
+            timeout=(30, 1800),
+        ) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", content_type).split(";", 1)[0]
+            with open(temp_path, "wb") as target:
+                for chunk in response.iter_content(1024 * 1024):
+                    if chunk:
+                        target.write(chunk)
+
+        if os.path.getsize(temp_path) < 1024:
+            raise RuntimeError("생성된 음원 파일이 비정상적으로 작습니다.")
+
+        r2_client().upload_file(
+            temp_path,
+            R2_BUCKET_NAME,
+            storage_key,
+            ExtraArgs={"ContentType": content_type},
+        )
+        return signed_url(storage_key), storage_key, content_type
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
 
 
-def _absolute_worker_url(path_or_url: str) -> str:
-    text = str(path_or_url or "").strip()
-    if text.startswith("http://") or text.startswith("https://"):
-        return text
-    return urljoin(f"{ACE_STEP_WORKER_URL}/", text.lstrip("/"))
-
-
-def _save(job: dict) -> dict:
-    _ensure_database()
-    _db.save_job(job)
-    return job
-
-
-def _load(job_id: str):
-    _ensure_database()
-    return _db.load_job(job_id)
-
-
-def _submit_worker(job: dict) -> dict:
+def submit_official_task(job: dict) -> str:
     response = requests.post(
-        f"{ACE_STEP_WORKER_URL}/ace-step/start",
-        headers=_worker_headers(),
+        f"{ACE_STEP_WORKER_URL}/release_task",
+        headers=worker_headers(include_json=True),
         json={
-            "job_id": job["job_id"],
-            "title": job["title"],
-            "lyrics": job["lyrics"],
             "prompt": job["prompt"],
-            "duration": job["duration_seconds"],
-            "seed": job.get("seed", -1),
-            "bpm": job.get("bpm", 0),
+            "lyrics": job["lyrics"],
+            "thinking": True,
+            "use_format": False,
+            "model": ACE_STEP_MODEL,
+            "lm_model_path": ACE_STEP_LM_MODEL,
+            "lm_backend": "pt",
+            "vocal_language": "ko",
+            "inference_steps": 8,
+            "batch_size": 1,
+            "audio_format": "mp3",
+            "task_type": "text2music",
+            "use_random_seed": True,
         },
         timeout=(30, 180),
     )
-    return _checked_json(response)
+    payload = checked_json(response)
+    task = payload.get("data") or {}
+    task_id = str(task.get("task_id") or "").strip()
+    if not task_id:
+        raise RuntimeError("ACE-Step /release_task 응답에 task_id가 없습니다.")
+    return task_id
 
 
-def _query_worker(worker_job_id: str) -> dict:
-    response = requests.get(
-        f"{ACE_STEP_WORKER_URL}/ace-step/status",
-        headers=_worker_headers(),
-        params={"job_id": worker_job_id},
+def query_official_task(worker_task_id: str) -> dict:
+    response = requests.post(
+        f"{ACE_STEP_WORKER_URL}/query_result",
+        headers=worker_headers(include_json=True),
+        json={"task_id_list": [worker_task_id]},
         timeout=(30, 180),
     )
-    return _checked_json(response)
+    payload = checked_json(response)
+    rows = payload.get("data") or []
+    if not rows:
+        return {"status": 0}
+    return rows[0]
 
 
-def _finish_from_worker(job: dict, worker: dict) -> dict:
-    storage_key = str(worker.get("audio_storage_key") or "").strip()
-    if storage_key:
-        permanent_url = _storage.signed_url(storage_key)
+def parse_official_result(row: dict) -> dict:
+    raw_result = row.get("result")
+    if not raw_result:
+        return {}
+    if isinstance(raw_result, str):
+        parsed = json.loads(raw_result)
     else:
-        remote_url = _absolute_worker_url(worker.get("audio_url") or worker.get("mp3_url") or "")
-        if not remote_url:
-            raise RuntimeError("ACE-Step Worker 성공 응답에 음원 위치가 없습니다.")
-        permanent_url, storage_key = _storage.persist_remote_file(
-            job_id=job["job_id"],
-            field_name="ace_step_master",
-            remote_url=remote_url,
-            default_ext=".mp3",
-            headers=_worker_headers(),
-        )
-
-    job.update(
-        status="done",
-        message="ACE-Step 생성 및 MP3 영구 저장이 완료되었습니다.",
-        debug_step="ace_done",
-        audio_url=permanent_url,
-        wav_url="",
-        mp3_url=permanent_url,
-        audio_url_storage_key=storage_key,
-        duration_ms=int(worker.get("duration_ms") or float(worker.get("duration") or 0) * 1000),
-        sample_rate=int(worker.get("sample_rate") or 0),
-        generation_seconds=float(worker.get("generation_seconds") or 0),
-        ace_worker_result=worker,
-    )
-    return _save(job)
+        parsed = raw_result
+    if isinstance(parsed, list):
+        return parsed[0] if parsed else {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
-def _sync_once(job: dict) -> dict:
-    worker_job_id = str(job.get("ace_worker_job_id") or job["job_id"])
-    worker = _query_worker(worker_job_id)
-    worker_status = str(worker.get("status") or "").lower()
-
-    if worker_status in {"queued", "pending"}:
-        job.update(status="queued", message=worker.get("message") or "ACE-Step 생성 대기 중입니다.", debug_step="ace_queued")
-        return _save(job)
-    if worker_status in {"running", "processing"}:
-        job.update(status="processing", message=worker.get("message") or "ACE-Step에서 음악을 생성하고 있습니다.", debug_step="ace_generating")
-        return _save(job)
-    if worker_status in {"success", "done", "completed"}:
-        return _finish_from_worker(job, worker)
-    if worker_status in {"failed", "error"}:
-        job.update(status="failed", message=worker.get("message") or "ACE-Step Worker가 생성 실패를 반환했습니다.", debug_step="ace_error", ace_worker_result=worker)
-        return _save(job)
-
-    job.update(message=f"ACE-Step Worker 상태 확인 중: {worker_status or 'unknown'}", debug_step="ace_status_unknown")
-    return _save(job)
-
-
-def _run_generation(job_id: str) -> None:
-    job = _load(job_id)
+def run_generation(job_id: str) -> None:
+    job = load_job(job_id)
     if not job:
         return
-    try:
-        worker = _submit_worker(job)
-        worker_status = str(worker.get("status") or "").lower()
-        if worker_status == "failed":
-            raise RuntimeError(worker.get("message") or "ACE-Step Worker 요청이 거절되었습니다.")
 
-        worker_job_id = str(worker.get("job_id") or job_id)
+    try:
+        if not ACE_STEP_WORKER_URL:
+            raise RuntimeError("ACE_STEP_WORKER_URL 환경변수가 없습니다.")
+
         job.update(
-            ace_worker_job_id=worker_job_id,
-            status="queued",
-            message=worker.get("message") or "ACE-Step 생성 요청을 접수했습니다.",
-            debug_step="ace_submitted",
+            status="processing",
+            message="ACE-Step 작업을 전송하고 있습니다.",
+            debug_step="ace_submit",
         )
-        _save(job)
+        save_job(job)
+
+        worker_task_id = submit_official_task(job)
+        job.update(
+            ace_worker_task_id=worker_task_id,
+            message="ACE-Step에서 음악을 생성하고 있습니다.",
+            debug_step="ace_generating",
+        )
+        save_job(job)
 
         deadline = time.monotonic() + ACE_STEP_TIMEOUT_SECONDS
+        result = {}
         while time.monotonic() < deadline:
-            job = _load(job_id) or job
-            job = _sync_once(job)
-            if job.get("status") in {"done", "failed"}:
-                return
-            time.sleep(ACE_STEP_POLL_SECONDS)
+            row = query_official_task(worker_task_id)
+            worker_status = int(row.get("status") or 0)
 
-        job.update(status="failed", message=f"ACE-Step 생성 제한시간 {ACE_STEP_TIMEOUT_SECONDS}초를 초과했습니다.", debug_step="ace_timeout")
-        _save(job)
+            if worker_status == 1:
+                result = parse_official_result(row)
+                break
+            if worker_status == 2:
+                result = parse_official_result(row)
+                error_text = result.get("error") or result.get("message") or row.get("error")
+                raise RuntimeError(error_text or "ACE-Step Worker가 생성 실패를 반환했습니다.")
+
+            time.sleep(ACE_STEP_POLL_SECONDS)
+        else:
+            raise TimeoutError(f"ACE-Step 생성 제한시간 {ACE_STEP_TIMEOUT_SECONDS}초를 초과했습니다.")
+
+        file_value = str(result.get("file") or "").strip()
+        if not file_value:
+            raise RuntimeError("ACE-Step 결과에 음원 file 경로가 없습니다.")
+
+        remote_audio_url = absolute_worker_url(file_value)
+        permanent_url, storage_key, content_type = persist_audio(job_id, remote_audio_url)
+
+        metas = result.get("metas") if isinstance(result.get("metas"), dict) else {}
+        duration_seconds = float(metas.get("duration") or 0)
+        job.update(
+            status="done",
+            message="ACE-Step 생성 및 R2 저장이 완료되었습니다.",
+            debug_step="ace_done",
+            audio_url=permanent_url,
+            mp3_url=permanent_url,
+            audio_url_storage_key=storage_key,
+            audio_content_type=content_type,
+            duration_ms=max(0, int(duration_seconds * 1000)),
+            ace_worker_result=result,
+        )
+        save_job(job)
+
     except Exception as exc:
-        job = _load(job_id) or job
-        job.update(status="failed", message=f"ACE-Step 생성 실패: {type(exc).__name__} / {exc}", debug_step="ace_error")
-        _save(job)
+        job.update(
+            status="failed",
+            message=f"ACE-Step 생성 실패: {type(exc).__name__} / {exc}",
+            debug_step="ace_error",
+        )
+        save_job(job)
 
 
 @router.post("/generate")
@@ -200,9 +291,9 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
 
     if not title or not lyrics or not prompt:
         return {"status": "failed", "message": "제목, 가사, 프롬프트를 모두 입력하세요."}
-    if not _db.enabled:
+    if not DATABASE_URL:
         return {"status": "failed", "message": "DATABASE_URL 환경변수가 없습니다."}
-    if not _storage.enabled:
+    if not all([R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
         return {"status": "failed", "message": "R2 환경변수가 완성되지 않았습니다."}
     if not ACE_STEP_WORKER_URL:
         return {"status": "failed", "message": "ACE_STEP_WORKER_URL 환경변수가 없습니다."}
@@ -217,38 +308,28 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
         "title": title,
         "lyrics": lyrics,
         "prompt": prompt,
-        "duration_seconds": _safe_duration(payload.get("duration", ACE_STEP_DEFAULT_DURATION)),
-        "seed": int(payload.get("seed", -1) or -1),
-        "bpm": int(payload.get("bpm", 0) or 0),
+        "file_name": f"{title}.mp3",
         "audio_url": "",
-        "wav_url": "",
         "mp3_url": "",
         "duration_ms": 0,
-        "created_at": DatabaseService.utc_now_iso(),
+        "created_at": utc_now_iso(),
+        "updated_at": utc_now_iso(),
     }
-    _save(job)
-    background_tasks.add_task(_run_generation, job_id)
+    save_job(job)
+    background_tasks.add_task(run_generation, job_id)
     return {"status": "accepted", "job_id": job_id, "message": "ACE-Step 생성을 시작합니다."}
 
 
 @router.get("/status")
 def generation_status(job_id: str = Query(...)):
-    job = _load(job_id)
+    job = load_job(job_id)
     if not job or job.get("job_type") != "ace_step_create":
         return {"status": "failed", "job_id": job_id, "message": "ACE-Step 작업을 찾지 못했습니다."}
 
-    if job.get("status") in {"queued", "processing"} and job.get("ace_worker_job_id"):
-        try:
-            job = _sync_once(job)
-        except Exception as exc:
-            job["message"] = f"상태 확인 재시도 예정: {type(exc).__name__} / {exc}"
-            _save(job)
-
     storage_key = job.get("audio_url_storage_key", "")
     if storage_key and job.get("status") == "done":
-        fresh_url = _storage.signed_url(storage_key)
+        fresh_url = signed_url(storage_key)
         job["audio_url"] = fresh_url
-        job["wav_url"] = ""
         job["mp3_url"] = fresh_url
 
     return {
@@ -260,33 +341,22 @@ def generation_status(job_id: str = Query(...)):
         "lyrics": job.get("lyrics", ""),
         "prompt": job.get("prompt", ""),
         "audio_url": job.get("audio_url", ""),
-        "wav_url": job.get("wav_url", ""),
         "mp3_url": job.get("mp3_url", ""),
         "duration_ms": int(job.get("duration_ms") or 0),
-        "sample_rate": int(job.get("sample_rate") or 0),
     }
 
 
 @router.get("/health")
 def ace_step_health():
-    result = {
-        "status": "success",
-        "database": "configured" if _db.enabled else "missing",
-        "storage": "configured" if _storage.enabled else "missing",
-        "worker_url": ACE_STEP_WORKER_URL,
-    }
     if not ACE_STEP_WORKER_URL:
-        result.update(status="failed", message="ACE_STEP_WORKER_URL 환경변수가 없습니다.")
-        return result
+        return {"status": "failed", "message": "ACE_STEP_WORKER_URL 환경변수가 없습니다."}
     try:
-        response = requests.get(ACE_STEP_WORKER_URL, headers=_worker_headers(), timeout=(15, 60))
-        result["worker"] = _checked_json(response)
-        if _db.enabled:
-            _ensure_database()
-            result["database_health"] = _db.health_check()
-        if _storage.enabled:
-            result["storage_health"] = _storage.health_check()
-        return result
+        response = requests.get(
+            f"{ACE_STEP_WORKER_URL}/health",
+            headers=worker_headers(),
+            timeout=(15, 60),
+        )
+        payload = checked_json(response)
+        return {"status": "success", "worker": payload}
     except Exception as exc:
-        result.update(status="failed", message=f"{type(exc).__name__}: {exc}")
-        return result
+        return {"status": "failed", "message": f"{type(exc).__name__}: {exc}"}
