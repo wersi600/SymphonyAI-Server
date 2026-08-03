@@ -16,8 +16,8 @@ ACE_STEP_WORKER_URL = os.environ.get("ACE_STEP_WORKER_URL", "").rstrip("/")
 ACE_STEP_API_KEY = os.environ.get("ACE_STEP_API_KEY", "").strip()
 ACE_STEP_POLL_SECONDS = max(2, int(os.environ.get("ACE_STEP_POLL_SECONDS", "5")))
 ACE_STEP_TIMEOUT_SECONDS = max(120, int(os.environ.get("ACE_STEP_TIMEOUT_SECONDS", "3600")))
-ACE_STEP_DEFAULT_DURATION = max(10.0, float(os.environ.get("ACE_STEP_DEFAULT_DURATION", "30")))
-ACE_STEP_MAX_DURATION = max(ACE_STEP_DEFAULT_DURATION, float(os.environ.get("ACE_STEP_MAX_DURATION", "180")))
+ACE_STEP_DEFAULT_DURATION = max(210.0, float(os.environ.get("ACE_STEP_DEFAULT_DURATION", "210")))
+ACE_STEP_MAX_DURATION = max(300.0, ACE_STEP_DEFAULT_DURATION, float(os.environ.get("ACE_STEP_MAX_DURATION", "300")))
 
 _db = DatabaseService()
 _storage = StorageService()
@@ -46,7 +46,7 @@ def _checked_json(response: requests.Response) -> dict:
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
-        raise RuntimeError("ACE-Step Worker 응답이 JSON 객체가 아닙니다.")
+        raise RuntimeError("ACE-Step Worker �묐떟�� JSON 媛앹껜媛� �꾨떃�덈떎.")
     return payload
 
 
@@ -55,7 +55,7 @@ def _safe_duration(value) -> float:
         duration = float(value)
     except Exception:
         duration = ACE_STEP_DEFAULT_DURATION
-    return max(10.0, min(ACE_STEP_MAX_DURATION, duration))
+    return max(180.0, min(ACE_STEP_MAX_DURATION, duration))
 
 
 def _absolute_worker_url(path_or_url: str) -> str:
@@ -111,7 +111,7 @@ def _finish_from_worker(job: dict, worker: dict) -> dict:
     else:
         remote_url = _absolute_worker_url(worker.get("audio_url") or worker.get("mp3_url") or "")
         if not remote_url:
-            raise RuntimeError("ACE-Step Worker 성공 응답에 음원 위치가 없습니다.")
+            raise RuntimeError("ACE-Step Worker �깃났 �묐떟�� �뚯썝 �꾩튂媛� �놁뒿�덈떎.")
         permanent_url, storage_key = _storage.persist_remote_file(
             job_id=job["job_id"],
             field_name="ace_step_master",
@@ -122,7 +122,7 @@ def _finish_from_worker(job: dict, worker: dict) -> dict:
 
     job.update(
         status="done",
-        message="ACE-Step 생성 및 MP3 영구 저장이 완료되었습니다.",
+        message="ACE-Step �앹꽦 諛� MP3 �곴뎄 ���μ씠 �꾨즺�섏뿀�듬땲��.",
         debug_step="ace_done",
         audio_url=permanent_url,
         wav_url="",
@@ -142,18 +142,18 @@ def _sync_once(job: dict) -> dict:
     worker_status = str(worker.get("status") or "").lower()
 
     if worker_status in {"queued", "pending"}:
-        job.update(status="queued", message=worker.get("message") or "ACE-Step 생성 대기 중입니다.", debug_step="ace_queued")
+        job.update(status="queued", message=worker.get("message") or "ACE-Step �앹꽦 ��湲� 以묒엯�덈떎.", debug_step="ace_queued")
         return _save(job)
     if worker_status in {"running", "processing"}:
-        job.update(status="processing", message=worker.get("message") or "ACE-Step에서 음악을 생성하고 있습니다.", debug_step="ace_generating")
+        job.update(status="processing", message=worker.get("message") or "ACE-Step�먯꽌 �뚯븙�� �앹꽦�섍퀬 �덉뒿�덈떎.", debug_step="ace_generating")
         return _save(job)
     if worker_status in {"success", "done", "completed"}:
         return _finish_from_worker(job, worker)
     if worker_status in {"failed", "error"}:
-        job.update(status="failed", message=worker.get("message") or "ACE-Step Worker가 생성 실패를 반환했습니다.", debug_step="ace_error", ace_worker_result=worker)
+        job.update(status="failed", message=worker.get("message") or "ACE-Step Worker媛� �앹꽦 �ㅽ뙣瑜� 諛섑솚�덉뒿�덈떎.", debug_step="ace_error", ace_worker_result=worker)
         return _save(job)
 
-    job.update(message=f"ACE-Step Worker 상태 확인 중: {worker_status or 'unknown'}", debug_step="ace_status_unknown")
+    job.update(message=f"ACE-Step Worker �곹깭 �뺤씤 以�: {worker_status or 'unknown'}", debug_step="ace_status_unknown")
     return _save(job)
 
 
@@ -165,13 +165,13 @@ def _run_generation(job_id: str) -> None:
         worker = _submit_worker(job)
         worker_status = str(worker.get("status") or "").lower()
         if worker_status == "failed":
-            raise RuntimeError(worker.get("message") or "ACE-Step Worker 요청이 거절되었습니다.")
+            raise RuntimeError(worker.get("message") or "ACE-Step Worker �붿껌�� 嫄곗젅�섏뿀�듬땲��.")
 
         worker_job_id = str(worker.get("job_id") or job_id)
         job.update(
             ace_worker_job_id=worker_job_id,
             status="queued",
-            message=worker.get("message") or "ACE-Step 생성 요청을 접수했습니다.",
+            message=worker.get("message") or "ACE-Step �앹꽦 �붿껌�� �묒닔�덉뒿�덈떎.",
             debug_step="ace_submitted",
         )
         _save(job)
@@ -184,11 +184,11 @@ def _run_generation(job_id: str) -> None:
                 return
             time.sleep(ACE_STEP_POLL_SECONDS)
 
-        job.update(status="failed", message=f"ACE-Step 생성 제한시간 {ACE_STEP_TIMEOUT_SECONDS}초를 초과했습니다.", debug_step="ace_timeout")
+        job.update(status="failed", message=f"ACE-Step �앹꽦 �쒗븳�쒓컙 {ACE_STEP_TIMEOUT_SECONDS}珥덈� 珥덇낵�덉뒿�덈떎.", debug_step="ace_timeout")
         _save(job)
     except Exception as exc:
         job = _load(job_id) or job
-        job.update(status="failed", message=f"ACE-Step 생성 실패: {type(exc).__name__} / {exc}", debug_step="ace_error")
+        job.update(status="failed", message=f"ACE-Step �앹꽦 �ㅽ뙣: {type(exc).__name__} / {exc}", debug_step="ace_error")
         _save(job)
 
 
@@ -199,20 +199,20 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
     prompt = str(payload.get("prompt") or "").strip()
 
     if not title or not lyrics or not prompt:
-        return {"status": "failed", "message": "제목, 가사, 프롬프트를 모두 입력하세요."}
+        return {"status": "failed", "message": "�쒕ぉ, 媛���, �꾨＼�꾪듃瑜� 紐⑤몢 �낅젰�섏꽭��."}
     if not _db.enabled:
-        return {"status": "failed", "message": "DATABASE_URL 환경변수가 없습니다."}
+        return {"status": "failed", "message": "DATABASE_URL �섍꼍蹂��섍� �놁뒿�덈떎."}
     if not _storage.enabled:
-        return {"status": "failed", "message": "R2 환경변수가 완성되지 않았습니다."}
+        return {"status": "failed", "message": "R2 �섍꼍蹂��섍� �꾩꽦�섏� �딆븯�듬땲��."}
     if not ACE_STEP_WORKER_URL:
-        return {"status": "failed", "message": "ACE_STEP_WORKER_URL 환경변수가 없습니다."}
+        return {"status": "failed", "message": "ACE_STEP_WORKER_URL �섍꼍蹂��섍� �놁뒿�덈떎."}
 
     job_id = str(uuid.uuid4())
     job = {
         "job_id": job_id,
         "job_type": "ace_step_create",
         "status": "queued",
-        "message": "ACE-Step 생성 대기 중입니다.",
+        "message": "ACE-Step �앹꽦 ��湲� 以묒엯�덈떎.",
         "debug_step": "ace_queued",
         "title": title,
         "lyrics": lyrics,
@@ -228,20 +228,20 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
     }
     _save(job)
     background_tasks.add_task(_run_generation, job_id)
-    return {"status": "accepted", "job_id": job_id, "message": "ACE-Step 생성을 시작합니다."}
+    return {"status": "accepted", "job_id": job_id, "message": "ACE-Step �앹꽦�� �쒖옉�⑸땲��."}
 
 
 @router.get("/status")
 def generation_status(job_id: str = Query(...)):
     job = _load(job_id)
     if not job or job.get("job_type") != "ace_step_create":
-        return {"status": "failed", "job_id": job_id, "message": "ACE-Step 작업을 찾지 못했습니다."}
+        return {"status": "failed", "job_id": job_id, "message": "ACE-Step �묒뾽�� 李얠� 紐삵뻽�듬땲��."}
 
     if job.get("status") in {"queued", "processing"} and job.get("ace_worker_job_id"):
         try:
             job = _sync_once(job)
         except Exception as exc:
-            job["message"] = f"상태 확인 재시도 예정: {type(exc).__name__} / {exc}"
+            job["message"] = f"�곹깭 �뺤씤 �ъ떆�� �덉젙: {type(exc).__name__} / {exc}"
             _save(job)
 
     storage_key = job.get("audio_url_storage_key", "")
@@ -276,7 +276,7 @@ def ace_step_health():
         "worker_url": ACE_STEP_WORKER_URL,
     }
     if not ACE_STEP_WORKER_URL:
-        result.update(status="failed", message="ACE_STEP_WORKER_URL 환경변수가 없습니다.")
+        result.update(status="failed", message="ACE_STEP_WORKER_URL �섍꼍蹂��섍� �놁뒿�덈떎.")
         return result
     try:
         response = requests.get(ACE_STEP_WORKER_URL, headers=_worker_headers(), timeout=(15, 60))
