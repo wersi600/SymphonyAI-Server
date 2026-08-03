@@ -16,8 +16,6 @@ ACE_STEP_WORKER_URL = os.environ.get("ACE_STEP_WORKER_URL", "").rstrip("/")
 ACE_STEP_API_KEY = os.environ.get("ACE_STEP_API_KEY", "").strip()
 ACE_STEP_POLL_SECONDS = max(2, int(os.environ.get("ACE_STEP_POLL_SECONDS", "5")))
 ACE_STEP_TIMEOUT_SECONDS = max(120, int(os.environ.get("ACE_STEP_TIMEOUT_SECONDS", "3600")))
-ACE_STEP_DEFAULT_DURATION = max(210.0, float(os.environ.get("ACE_STEP_DEFAULT_DURATION", "210")))
-ACE_STEP_MAX_DURATION = max(300.0, ACE_STEP_DEFAULT_DURATION, float(os.environ.get("ACE_STEP_MAX_DURATION", "300")))
 
 _db = DatabaseService()
 _storage = StorageService()
@@ -50,12 +48,14 @@ def _checked_json(response: requests.Response) -> dict:
     return payload
 
 
-def _safe_duration(value) -> float:
+def _optional_duration(value):
+    if value in (None, "", -1, "-1"):
+        return None
     try:
         duration = float(value)
     except Exception:
-        duration = ACE_STEP_DEFAULT_DURATION
-    return max(180.0, min(ACE_STEP_MAX_DURATION, duration))
+        return None
+    return max(10.0, min(600.0, duration))
 
 
 def _absolute_worker_url(path_or_url: str) -> str:
@@ -217,7 +217,7 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
         "title": title,
         "lyrics": lyrics,
         "prompt": prompt,
-        "duration_seconds": _safe_duration(payload.get("duration", ACE_STEP_DEFAULT_DURATION)),
+        "duration_seconds": _optional_duration(payload.get("duration")),
         "seed": int(payload.get("seed", -1) or -1),
         "bpm": int(payload.get("bpm", 0) or 0),
         "audio_url": "",
