@@ -16,6 +16,8 @@ ACE_STEP_WORKER_URL = os.environ.get("ACE_STEP_WORKER_URL", "").rstrip("/")
 ACE_STEP_API_KEY = os.environ.get("ACE_STEP_API_KEY", "").strip()
 ACE_STEP_POLL_SECONDS = max(2, int(os.environ.get("ACE_STEP_POLL_SECONDS", "5")))
 ACE_STEP_TIMEOUT_SECONDS = max(120, int(os.environ.get("ACE_STEP_TIMEOUT_SECONDS", "3600")))
+ACE_STEP_WAKE_TIMEOUT_SECONDS = max(120, int(os.environ.get("ACE_STEP_WAKE_TIMEOUT_SECONDS", "900")))
+ACE_STEP_WAKE_RETRY_SECONDS = max(3, int(os.environ.get("ACE_STEP_WAKE_RETRY_SECONDS", "10")))
 
 _db = DatabaseService()
 _storage = StorageService()
@@ -89,9 +91,47 @@ def _submit_worker(job: dict) -> dict:
             "seed": job.get("seed", -1),
             "bpm": job.get("bpm", 0),
         },
-        timeout=(30, 180),
+        timeout=(15, 60),
     )
     return _checked_json(response)
+
+
+def _is_cold_start_error(exc: Exception) -> bool:
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        return response is not None and response.status_code in {408, 425, 429, 500, 502, 503, 504}
+    return isinstance(
+        exc,
+        (requests.ConnectionError, requests.Timeout, requests.exceptions.JSONDecodeError),
+    )
+
+
+def _submit_worker_after_wake(job: dict) -> dict:
+    """Wake a sleeping HF Space and keep the Render job queued until it is ready."""
+    started = time.monotonic()
+    deadline = started + ACE_STEP_WAKE_TIMEOUT_SECONDS
+    last_error = None
+
+    while time.monotonic() < deadline:
+        try:
+            return _submit_worker(job)
+        except Exception as exc:
+            if not _is_cold_start_error(exc):
+                raise
+            last_error = exc
+            elapsed = int(time.monotonic() - started)
+            job.update(
+                status="queued",
+                message=f"AI 작곡 엔진을 깨우고 있습니다. ({elapsed}초 경과)",
+                debug_step="ace_worker_waking",
+            )
+            _save(job)
+            time.sleep(ACE_STEP_WAKE_RETRY_SECONDS)
+
+    raise RuntimeError(
+        f"AI 작곡 엔진 시작 제한시간 {ACE_STEP_WAKE_TIMEOUT_SECONDS}초를 초과했습니다. "
+        f"마지막 오류: {type(last_error).__name__ if last_error else 'unknown'} / {last_error}"
+    )
 
 
 def _query_worker(worker_job_id: str) -> dict:
@@ -105,35 +145,29 @@ def _query_worker(worker_job_id: str) -> dict:
 
 
 def _finish_from_worker(job: dict, worker: dict) -> dict:
-    wav_storage_key = str(worker.get("audio_storage_key") or "").strip()
-    if wav_storage_key:
-        wav_url = _storage.signed_url(wav_storage_key)
+    storage_key = str(worker.get("audio_storage_key") or "").strip()
+    if storage_key:
+        permanent_url = _storage.signed_url(storage_key)
     else:
         remote_url = _absolute_worker_url(worker.get("audio_url") or worker.get("mp3_url") or "")
         if not remote_url:
             raise RuntimeError("ACE-Step Worker 성공 응답에 음원 위치가 없습니다.")
-        wav_url, wav_storage_key = _storage.persist_remote_file(
+        permanent_url, storage_key = _storage.persist_remote_file(
             job_id=job["job_id"],
             field_name="ace_step_master",
             remote_url=remote_url,
-            default_ext=".wav",
+            default_ext=".mp3",
             headers=_worker_headers(),
         )
-
-    mp3_storage_key = f"projects/{job['job_id']}/results/ace_step_master.mp3"
-    _storage.transcode_storage_audio_to_mp3(wav_storage_key, mp3_storage_key)
-    mp3_url = _storage.signed_url(mp3_storage_key)
 
     job.update(
         status="done",
         message="ACE-Step 생성 및 MP3 영구 저장이 완료되었습니다.",
         debug_step="ace_done",
-        audio_url=mp3_url,
-        wav_url=wav_url,
-        mp3_url=mp3_url,
-        audio_url_storage_key=mp3_storage_key,
-        wav_url_storage_key=wav_storage_key,
-        mp3_url_storage_key=mp3_storage_key,
+        audio_url=permanent_url,
+        wav_url="",
+        mp3_url=permanent_url,
+        audio_url_storage_key=storage_key,
         duration_ms=int(worker.get("duration_ms") or float(worker.get("duration") or 0) * 1000),
         sample_rate=int(worker.get("sample_rate") or 0),
         generation_seconds=float(worker.get("generation_seconds") or 0),
@@ -168,7 +202,7 @@ def _run_generation(job_id: str) -> None:
     if not job:
         return
     try:
-        worker = _submit_worker(job)
+        worker = _submit_worker_after_wake(job)
         worker_status = str(worker.get("status") or "").lower()
         if worker_status == "failed":
             raise RuntimeError(worker.get("message") or "ACE-Step Worker 요청이 거절되었습니다.")
@@ -250,8 +284,12 @@ def generation_status(job_id: str = Query(...)):
             job["message"] = f"상태 확인 재시도 예정: {type(exc).__name__} / {exc}"
             _save(job)
 
-    if job.get("status") == "done":
-        job = _storage.refresh_job_urls(job)
+    storage_key = job.get("audio_url_storage_key", "")
+    if storage_key and job.get("status") == "done":
+        fresh_url = _storage.signed_url(storage_key)
+        job["audio_url"] = fresh_url
+        job["wav_url"] = ""
+        job["mp3_url"] = fresh_url
 
     return {
         "status": job.get("status", "failed"),
