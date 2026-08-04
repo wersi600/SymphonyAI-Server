@@ -105,29 +105,35 @@ def _query_worker(worker_job_id: str) -> dict:
 
 
 def _finish_from_worker(job: dict, worker: dict) -> dict:
-    storage_key = str(worker.get("audio_storage_key") or "").strip()
-    if storage_key:
-        permanent_url = _storage.signed_url(storage_key)
+    wav_storage_key = str(worker.get("audio_storage_key") or "").strip()
+    if wav_storage_key:
+        wav_url = _storage.signed_url(wav_storage_key)
     else:
         remote_url = _absolute_worker_url(worker.get("audio_url") or worker.get("mp3_url") or "")
         if not remote_url:
             raise RuntimeError("ACE-Step Worker 성공 응답에 음원 위치가 없습니다.")
-        permanent_url, storage_key = _storage.persist_remote_file(
+        wav_url, wav_storage_key = _storage.persist_remote_file(
             job_id=job["job_id"],
             field_name="ace_step_master",
             remote_url=remote_url,
-            default_ext=".mp3",
+            default_ext=".wav",
             headers=_worker_headers(),
         )
+
+    mp3_storage_key = f"projects/{job['job_id']}/results/ace_step_master.mp3"
+    _storage.transcode_storage_audio_to_mp3(wav_storage_key, mp3_storage_key)
+    mp3_url = _storage.signed_url(mp3_storage_key)
 
     job.update(
         status="done",
         message="ACE-Step 생성 및 MP3 영구 저장이 완료되었습니다.",
         debug_step="ace_done",
-        audio_url=permanent_url,
-        wav_url="",
-        mp3_url=permanent_url,
-        audio_url_storage_key=storage_key,
+        audio_url=mp3_url,
+        wav_url=wav_url,
+        mp3_url=mp3_url,
+        audio_url_storage_key=mp3_storage_key,
+        wav_url_storage_key=wav_storage_key,
+        mp3_url_storage_key=mp3_storage_key,
         duration_ms=int(worker.get("duration_ms") or float(worker.get("duration") or 0) * 1000),
         sample_rate=int(worker.get("sample_rate") or 0),
         generation_seconds=float(worker.get("generation_seconds") or 0),
@@ -244,12 +250,8 @@ def generation_status(job_id: str = Query(...)):
             job["message"] = f"상태 확인 재시도 예정: {type(exc).__name__} / {exc}"
             _save(job)
 
-    storage_key = job.get("audio_url_storage_key", "")
-    if storage_key and job.get("status") == "done":
-        fresh_url = _storage.signed_url(storage_key)
-        job["audio_url"] = fresh_url
-        job["wav_url"] = ""
-        job["mp3_url"] = fresh_url
+    if job.get("status") == "done":
+        job = _storage.refresh_job_urls(job)
 
     return {
         "status": job.get("status", "failed"),

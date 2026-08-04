@@ -5,8 +5,12 @@ from pathlib import Path
 from typing import Tuple
 
 import boto3
+import imageio_ffmpeg
 import requests
 from botocore.config import Config
+from pydub import AudioSegment
+
+AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 class StorageService:
@@ -97,6 +101,34 @@ class StorageService:
                 os.remove(temp_path)
             except OSError:
                 pass
+
+    def transcode_storage_audio_to_mp3(
+        self,
+        source_storage_key: str,
+        target_storage_key: str,
+        bitrate: str = "320k",
+    ) -> str:
+        """Download an R2 audio object, encode a real MP3, and upload it."""
+        if not source_storage_key or not target_storage_key:
+            raise ValueError("원본과 대상 R2 저장 키가 필요합니다.")
+
+        source_fd, source_path = tempfile.mkstemp(prefix="remo_source_", suffix=Path(source_storage_key).suffix or ".wav")
+        mp3_fd, mp3_path = tempfile.mkstemp(prefix="remo_mp3_", suffix=".mp3")
+        os.close(source_fd)
+        os.close(mp3_fd)
+        try:
+            self.download_file(source_storage_key, source_path)
+            AudioSegment.from_file(source_path).export(mp3_path, format="mp3", bitrate=bitrate)
+            if os.path.getsize(mp3_path) < 1024:
+                raise RuntimeError("MP3 변환 결과가 비정상적으로 작습니다.")
+            self.upload_file(mp3_path, target_storage_key, "audio/mpeg")
+            return target_storage_key
+        finally:
+            for path in (source_path, mp3_path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     def refresh_job_urls(self, job: dict) -> dict:
         fields = (
