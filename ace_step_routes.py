@@ -194,11 +194,11 @@ def _run_generation(job_id: str) -> None:
 
 @router.post("/generate")
 def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
-    title = str(payload.get("title") or "").strip()
-    lyrics = str(payload.get("lyrics") or "").strip()
-    prompt = str(payload.get("prompt") or "").strip()
+    title = str(payload.get("title") or "")
+    lyrics = str(payload.get("lyrics") or "")
+    prompt = str(payload.get("prompt") or "")
 
-    if not title or not lyrics or not prompt:
+    if not title.strip() or not lyrics.strip() or not prompt.strip():
         return {"status": "failed", "message": "제목, 가사, 프롬프트를 모두 입력하세요."}
     if not _db.enabled:
         return {"status": "failed", "message": "DATABASE_URL 환경변수가 없습니다."}
