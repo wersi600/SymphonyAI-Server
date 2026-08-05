@@ -145,7 +145,7 @@ class StorageService:
         fields = (
             "audio_url", "vocal_url", "accompaniment_url", "bass_url", "drums_url",
             "other_url", "midi_url", "raw_yourmt3_midi_url", "melody_midi_url",
-            "accompaniment_midi_url", "mp3_url", "wav_url", "musicxml_url",
+            "accompaniment_midi_url", "mp3_url", "musicxml_url",
         )
         for field in fields:
             key = job.get(f"{field}_storage_key", "")
