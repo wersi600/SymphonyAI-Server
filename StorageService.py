@@ -107,6 +107,8 @@ class StorageService:
         source_storage_key: str,
         target_storage_key: str,
         bitrate: str = "320k",
+        title: str = "",
+        artist: str = "REMO AI Music Studio",
     ) -> str:
         """Download an R2 audio object, encode a real MP3, and upload it."""
         if not source_storage_key or not target_storage_key:
@@ -118,7 +120,16 @@ class StorageService:
         os.close(mp3_fd)
         try:
             self.download_file(source_storage_key, source_path)
-            AudioSegment.from_file(source_path).export(mp3_path, format="mp3", bitrate=bitrate)
+            tags = {"artist": artist}
+            if title.strip():
+                tags["title"] = title.strip()
+            AudioSegment.from_file(source_path).export(
+                mp3_path,
+                format="mp3",
+                bitrate=bitrate,
+                tags=tags,
+                id3v2_version="3",
+            )
             if os.path.getsize(mp3_path) < 1024:
                 raise RuntimeError("MP3 변환 결과가 비정상적으로 작습니다.")
             self.upload_file(mp3_path, target_storage_key, "audio/mpeg")
