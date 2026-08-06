@@ -1,6 +1,5 @@
 import os
 import hashlib
-import re
 import threading
 import time
 import uuid
@@ -59,9 +58,7 @@ def _optional_duration(value):
         duration = float(value)
     except Exception:
         return None
-    if not 60.0 <= duration <= 480.0:
-        return None
-    return duration
+    return max(10.0, min(600.0, duration))
 
 
 def _exact_lyrics_contract(payload: dict) -> tuple[str, int, str]:
@@ -76,16 +73,6 @@ def _exact_lyrics_contract(payload: dict) -> tuple[str, int, str]:
             "가사 원문 무손실 검사 실패: "
             f"expected_lines={expected_lines}, actual_lines={line_count}, "
             f"expected_sha256={expected_digest}, actual_sha256={digest}"
-        )
-    collapsed_tag_lines = [
-        index + 1
-        for index, line in enumerate(lyrics.split("\n"))
-        if re.match(r"^\s*\[[^\]]+\]\s+\S", line)
-    ]
-    if collapsed_tag_lines:
-        raise ValueError(
-            "가사 구간 태그 뒤의 줄바꿈이 사라졌습니다. "
-            f"태그와 가사를 각각 별도 줄에 입력하세요: {collapsed_tag_lines}행"
         )
     return lyrics, line_count, digest
 
@@ -299,8 +286,6 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
     if not title.strip() or not lyrics.strip() or not prompt.strip():
         return {"status": "failed", "message": "제목, 가사, 프롬프트를 모두 입력하세요."}
     requested_duration = _optional_duration(payload.get("duration"))
-    if requested_duration is None:
-        return {"status": "failed", "message": "곡 전체 길이가 전달되지 않았습니다. 60~480초로 지정하세요."}
     if not _db.enabled:
         return {"status": "failed", "message": "DATABASE_URL 환경변수가 없습니다."}
     if not _storage.enabled:
