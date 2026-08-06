@@ -1,5 +1,6 @@
 import os
 import hashlib
+import re
 import threading
 import time
 import uuid
@@ -22,6 +23,8 @@ _db = DatabaseService()
 _storage = StorageService()
 _db_init_lock = threading.Lock()
 _db_initialized = False
+_mp3_finalize_lock = threading.Lock()
+_mp3_finalize_jobs: set[str] = set()
 
 
 def _ensure_database() -> None:
@@ -56,7 +59,9 @@ def _optional_duration(value):
         duration = float(value)
     except Exception:
         return None
-    return max(10.0, min(600.0, duration))
+    if not 60.0 <= duration <= 480.0:
+        return None
+    return duration
 
 
 def _exact_lyrics_contract(payload: dict) -> tuple[str, int, str]:
@@ -71,6 +76,16 @@ def _exact_lyrics_contract(payload: dict) -> tuple[str, int, str]:
             "가사 원문 무손실 검사 실패: "
             f"expected_lines={expected_lines}, actual_lines={line_count}, "
             f"expected_sha256={expected_digest}, actual_sha256={digest}"
+        )
+    collapsed_tag_lines = [
+        index + 1
+        for index, line in enumerate(lyrics.split("\n"))
+        if re.match(r"^\s*\[[^\]]+\]\s+\S", line)
+    ]
+    if collapsed_tag_lines:
+        raise ValueError(
+            "가사 구간 태그 뒤의 줄바꿈이 사라졌습니다. "
+            f"태그와 가사를 각각 별도 줄에 입력하세요: {collapsed_tag_lines}행"
         )
     return lyrics, line_count, digest
 
@@ -123,7 +138,58 @@ def _query_worker(worker_job_id: str) -> dict:
     return _checked_json(response)
 
 
+def _finalize_mp3(job_id: str, wav_storage_key: str, title: str) -> None:
+    mp3_storage_key = f"projects/{job_id}/results/ace_step_master.mp3"
+    try:
+        _storage.transcode_storage_audio_to_mp3(
+            wav_storage_key,
+            mp3_storage_key,
+            title=title,
+        )
+        mp3_url = _storage.signed_url(mp3_storage_key)
+        job = _load(job_id)
+        if job:
+            job.update(
+                message="생성곡 저장이 완료되었습니다.",
+                debug_step="ace_done",
+                audio_url=mp3_url,
+                mp3_url=mp3_url,
+                audio_url_storage_key=mp3_storage_key,
+                mp3_url_storage_key=mp3_storage_key,
+                mp3_ready=True,
+                mp3_error="",
+            )
+            _save(job)
+    except Exception as exc:
+        job = _load(job_id)
+        if job:
+            job.update(
+                message="생성곡은 저장되었습니다. MP3 변환은 다시 시도할 수 있습니다.",
+                mp3_ready=False,
+                mp3_error=f"{type(exc).__name__}: {exc}",
+            )
+            _save(job)
+    finally:
+        with _mp3_finalize_lock:
+            _mp3_finalize_jobs.discard(job_id)
+
+
+def _queue_mp3_finalize(job_id: str, wav_storage_key: str, title: str) -> None:
+    with _mp3_finalize_lock:
+        if job_id in _mp3_finalize_jobs:
+            return
+        _mp3_finalize_jobs.add(job_id)
+    threading.Thread(
+        target=_finalize_mp3,
+        args=(job_id, wav_storage_key, title),
+        name=f"remo-mp3-{job_id[:8]}",
+        daemon=True,
+    ).start()
+
+
 def _finish_from_worker(job: dict, worker: dict) -> dict:
+    if job.get("status") == "done":
+        return job
     wav_storage_key = str(worker.get("audio_storage_key") or "").strip()
     if wav_storage_key:
         wav_url = _storage.signed_url(wav_storage_key)
@@ -139,30 +205,29 @@ def _finish_from_worker(job: dict, worker: dict) -> dict:
             headers=_worker_headers(),
         )
 
-    mp3_storage_key = f"projects/{job['job_id']}/results/ace_step_master.mp3"
-    _storage.transcode_storage_audio_to_mp3(
-        wav_storage_key,
-        mp3_storage_key,
-        title=str(job.get("title") or "").strip(),
-    )
-    mp3_url = _storage.signed_url(mp3_storage_key)
-
     job.update(
         status="done",
-        message="ACE-Step 생성 및 MP3 영구 저장이 완료되었습니다.",
-        debug_step="ace_done",
-        audio_url=mp3_url,
+        message="생성곡 저장 완료 · MP3를 준비하고 있습니다.",
+        debug_step="ace_audio_ready",
+        audio_url=wav_url,
         wav_url=wav_url,
-        mp3_url=mp3_url,
-        audio_url_storage_key=mp3_storage_key,
+        mp3_url="",
+        audio_url_storage_key=wav_storage_key,
         wav_url_storage_key=wav_storage_key,
-        mp3_url_storage_key=mp3_storage_key,
+        mp3_url_storage_key="",
+        mp3_ready=False,
         duration_ms=int(worker.get("duration_ms") or float(worker.get("duration") or 0) * 1000),
         sample_rate=int(worker.get("sample_rate") or 0),
         generation_seconds=float(worker.get("generation_seconds") or 0),
         ace_worker_result=worker,
     )
-    return _save(job)
+    saved = _save(job)
+    _queue_mp3_finalize(
+        job["job_id"],
+        wav_storage_key,
+        str(job.get("title") or "").strip(),
+    )
+    return saved
 
 
 def _sync_once(job: dict) -> dict:
@@ -233,6 +298,9 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
 
     if not title.strip() or not lyrics.strip() or not prompt.strip():
         return {"status": "failed", "message": "제목, 가사, 프롬프트를 모두 입력하세요."}
+    requested_duration = _optional_duration(payload.get("duration"))
+    if requested_duration is None:
+        return {"status": "failed", "message": "곡 전체 길이가 전달되지 않았습니다. 60~480초로 지정하세요."}
     if not _db.enabled:
         return {"status": "failed", "message": "DATABASE_URL 환경변수가 없습니다."}
     if not _storage.enabled:
@@ -252,7 +320,7 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
         "lyrics_line_count": lyrics_line_count,
         "lyrics_sha256": lyrics_sha256,
         "prompt": prompt,
-        "duration_seconds": _optional_duration(payload.get("duration")),
+        "duration_seconds": requested_duration,
         "seed": int(payload.get("seed", -1) or -1),
         "bpm": int(payload.get("bpm", 0) or 0),
         "audio_url": "",
@@ -295,6 +363,7 @@ def generation_status(job_id: str = Query(...)):
         "mp3_url": job.get("mp3_url", ""),
         "duration_ms": int(job.get("duration_ms") or 0),
         "sample_rate": int(job.get("sample_rate") or 0),
+        "mp3_ready": bool(job.get("mp3_ready")),
     }
 
 
