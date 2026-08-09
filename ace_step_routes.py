@@ -1,5 +1,6 @@
 import os
 import hashlib
+import json
 import threading
 import time
 import uuid
@@ -17,13 +18,12 @@ ACE_STEP_WORKER_URL = os.environ.get("ACE_STEP_WORKER_URL", "").rstrip("/")
 ACE_STEP_API_KEY = os.environ.get("ACE_STEP_API_KEY", "").strip()
 ACE_STEP_POLL_SECONDS = max(2, int(os.environ.get("ACE_STEP_POLL_SECONDS", "5")))
 ACE_STEP_TIMEOUT_SECONDS = max(120, int(os.environ.get("ACE_STEP_TIMEOUT_SECONDS", "3600")))
+ACE_STEP_DEDUP_STALE_SECONDS = max(300, int(os.environ.get("ACE_STEP_DEDUP_STALE_SECONDS", "7200")))
 
 _db = DatabaseService()
 _storage = StorageService()
 _db_init_lock = threading.Lock()
 _db_initialized = False
-_mp3_finalize_lock = threading.Lock()
-_mp3_finalize_jobs: set[str] = set()
 
 
 def _ensure_database() -> None:
@@ -77,6 +77,29 @@ def _exact_lyrics_contract(payload: dict) -> tuple[str, int, str]:
     return lyrics, line_count, digest
 
 
+def _generation_fingerprint(
+    *,
+    title: str,
+    lyrics: str,
+    prompt: str,
+    duration,
+    seed: int,
+    bpm: int,
+) -> str:
+    """Stable idempotency key for one logical music-generation request."""
+    canonical = {
+        "title": str(title or "").strip(),
+        # Lyrics are intentionally NOT stripped: exact layout is part of the request.
+        "lyrics": str(lyrics or ""),
+        "prompt": str(prompt or "").strip(),
+        "duration": None if duration is None else float(duration),
+        "seed": int(seed),
+        "bpm": int(bpm),
+    }
+    raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _absolute_worker_url(path_or_url: str) -> str:
     text = str(path_or_url or "").strip()
     if text.startswith("http://") or text.startswith("https://"):
@@ -125,97 +148,74 @@ def _query_worker(worker_job_id: str) -> dict:
     return _checked_json(response)
 
 
-def _finalize_mp3(job_id: str, wav_storage_key: str, title: str) -> None:
-    mp3_storage_key = f"projects/{job_id}/results/ace_step_master.mp3"
-    try:
-        _storage.transcode_storage_audio_to_mp3(
-            wav_storage_key,
-            mp3_storage_key,
-            title=title,
-        )
-        mp3_url = _storage.signed_url(mp3_storage_key)
-        job = _load(job_id)
-        if job:
-            job.update(
-                message="생성곡 저장이 완료되었습니다.",
-                debug_step="ace_done",
-                audio_url=mp3_url,
-                mp3_url=mp3_url,
-                audio_url_storage_key=mp3_storage_key,
-                mp3_url_storage_key=mp3_storage_key,
-                mp3_ready=True,
-                mp3_error="",
-            )
-            _save(job)
-    except Exception as exc:
-        job = _load(job_id)
-        if job:
-            job.update(
-                message="생성곡은 저장되었습니다. MP3 변환은 다시 시도할 수 있습니다.",
-                mp3_ready=False,
-                mp3_error=f"{type(exc).__name__}: {exc}",
-            )
-            _save(job)
-    finally:
-        with _mp3_finalize_lock:
-            _mp3_finalize_jobs.discard(job_id)
-
-
-def _queue_mp3_finalize(job_id: str, wav_storage_key: str, title: str) -> None:
-    with _mp3_finalize_lock:
-        if job_id in _mp3_finalize_jobs:
-            return
-        _mp3_finalize_jobs.add(job_id)
-    threading.Thread(
-        target=_finalize_mp3,
-        args=(job_id, wav_storage_key, title),
-        name=f"remo-mp3-{job_id[:8]}",
-        daemon=True,
-    ).start()
-
-
 def _finish_from_worker(job: dict, worker: dict) -> dict:
     if job.get("status") == "done":
         return job
-    wav_storage_key = str(worker.get("audio_storage_key") or "").strip()
+
+    # HF now persists the genuine WAV and genuine 320 kbps MP3 separately.
+    # Prefer storage keys (same R2) so Render can issue its own fresh signed URLs.
+    wav_storage_key = str(
+        worker.get("wav_storage_key")
+        or worker.get("audio_storage_key")
+        or ""
+    ).strip()
+    mp3_storage_key = str(worker.get("mp3_storage_key") or "").strip()
+
+    wav_url = ""
+    mp3_url = ""
+
     if wav_storage_key:
         wav_url = _storage.signed_url(wav_storage_key)
     else:
-        remote_url = _absolute_worker_url(worker.get("audio_url") or worker.get("mp3_url") or "")
-        if not remote_url:
-            raise RuntimeError("ACE-Step Worker 성공 응답에 음원 위치가 없습니다.")
-        wav_url, wav_storage_key = _storage.persist_remote_file(
-            job_id=job["job_id"],
-            field_name="ace_step_master",
-            remote_url=remote_url,
-            default_ext=".wav",
-            headers=_worker_headers(),
-        )
+        remote_wav = _absolute_worker_url(worker.get("wav_url") or worker.get("audio_url") or "")
+        if remote_wav:
+            wav_url, wav_storage_key = _storage.persist_remote_file(
+                job_id=job["job_id"],
+                field_name="ace_step_master",
+                remote_url=remote_wav,
+                default_ext=".wav",
+                headers=_worker_headers(),
+            )
+
+    if mp3_storage_key:
+        mp3_url = _storage.signed_url(mp3_storage_key)
+    else:
+        remote_mp3 = _absolute_worker_url(worker.get("mp3_url") or "")
+        if remote_mp3:
+            mp3_url, mp3_storage_key = _storage.persist_remote_file(
+                job_id=job["job_id"],
+                field_name="ace_step_master",
+                remote_url=remote_mp3,
+                default_ext=".mp3",
+                headers=_worker_headers(),
+            )
+
+    if not wav_url and not mp3_url:
+        raise RuntimeError("ACE-Step Worker 성공 응답에 WAV/MP3 위치가 없습니다.")
+
+    # Preserve existing app behavior: audio_url is the normal listening/download
+    # file (MP3 when available), while analysis/stem/MIDI can explicitly use wav_url.
+    audio_url = mp3_url or wav_url
+    audio_storage_key = mp3_storage_key or wav_storage_key
 
     job.update(
         status="done",
-        message="생성곡 저장 완료 · MP3를 준비하고 있습니다.",
-        debug_step="ace_audio_ready",
-        audio_url=wav_url,
+        message="생성곡 WAV·MP3 저장이 완료되었습니다." if mp3_url else "생성곡 WAV 저장이 완료되었습니다.",
+        debug_step="ace_done",
+        audio_url=audio_url,
         wav_url=wav_url,
-        mp3_url="",
-        audio_url_storage_key=wav_storage_key,
+        mp3_url=mp3_url,
+        audio_url_storage_key=audio_storage_key,
         wav_url_storage_key=wav_storage_key,
-        mp3_url_storage_key="",
-        mp3_ready=False,
+        mp3_url_storage_key=mp3_storage_key,
+        mp3_ready=bool(mp3_url),
+        mp3_error="" if mp3_url else "HF MP3 결과가 없습니다.",
         duration_ms=int(worker.get("duration_ms") or float(worker.get("duration") or 0) * 1000),
         sample_rate=int(worker.get("sample_rate") or 0),
         generation_seconds=float(worker.get("generation_seconds") or 0),
         ace_worker_result=worker,
     )
-    saved = _save(job)
-    _queue_mp3_finalize(
-        job["job_id"],
-        wav_storage_key,
-        str(job.get("title") or "").strip(),
-    )
-    return saved
-
+    return _save(job)
 
 def _sync_once(job: dict) -> dict:
     worker_job_id = str(job.get("ace_worker_job_id") or job["job_id"])
@@ -293,6 +293,17 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
     if not ACE_STEP_WORKER_URL:
         return {"status": "failed", "message": "ACE_STEP_WORKER_URL 환경변수가 없습니다."}
 
+    seed = int(payload.get("seed", -1) or -1)
+    bpm = int(payload.get("bpm", 0) or 0)
+    request_fingerprint = _generation_fingerprint(
+        title=title,
+        lyrics=lyrics,
+        prompt=prompt,
+        duration=requested_duration,
+        seed=seed,
+        bpm=bpm,
+    )
+
     job_id = str(uuid.uuid4())
     job = {
         "job_id": job_id,
@@ -306,17 +317,37 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
         "lyrics_sha256": lyrics_sha256,
         "prompt": prompt,
         "duration_seconds": requested_duration,
-        "seed": int(payload.get("seed", -1) or -1),
-        "bpm": int(payload.get("bpm", 0) or 0),
+        "seed": seed,
+        "bpm": bpm,
+        "request_fingerprint": request_fingerprint,
         "audio_url": "",
         "wav_url": "",
         "mp3_url": "",
         "duration_ms": 0,
         "created_at": DatabaseService.utc_now_iso(),
     }
-    _save(job)
+
+    existing_or_new, created_new = _db.create_or_get_active_job(
+        job,
+        request_fingerprint,
+        stale_after_seconds=ACE_STEP_DEDUP_STALE_SECONDS,
+    )
+    if not created_new:
+        existing_job_id = str(existing_or_new.get("job_id") or "")
+        return {
+            "status": "accepted",
+            "job_id": existing_job_id,
+            "message": "동일한 생성 요청이 이미 진행 중이어서 기존 작업을 계속 사용합니다.",
+            "deduplicated": True,
+        }
+
     background_tasks.add_task(_run_generation, job_id)
-    return {"status": "accepted", "job_id": job_id, "message": "ACE-Step 생성을 시작합니다."}
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "message": "ACE-Step 생성을 시작합니다.",
+        "deduplicated": False,
+    }
 
 
 @router.get("/status")

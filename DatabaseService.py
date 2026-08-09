@@ -65,6 +65,71 @@ class DatabaseService:
                 """, (job["job_id"], payload))
             conn.commit()
 
+
+    def create_or_get_active_job(
+        self,
+        job: dict,
+        request_fingerprint: str,
+        stale_after_seconds: int = 7200,
+    ) -> tuple[dict, bool]:
+        """Atomically create one active generation job per request fingerprint.
+
+        Returns (job, created_new). A PostgreSQL advisory transaction lock makes
+        simultaneous duplicate POSTs from multiple Render workers safe.
+        """
+        if not self.enabled:
+            raise RuntimeError("DATABASE_URL 환경변수가 없습니다.")
+
+        fingerprint = str(request_fingerprint or "").strip()
+        if not fingerprint:
+            raise ValueError("request_fingerprint가 비어 있습니다.")
+
+        job["request_fingerprint"] = fingerprint
+        job["updated_at"] = self.utc_now_iso()
+        payload = json.dumps(job, ensure_ascii=False, default=str)
+        stale_after_seconds = max(60, int(stale_after_seconds))
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                # Same fingerprint is serialized even when two HTTP requests
+                # arrive at different Render processes at the same instant.
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s)::bigint)",
+                    (fingerprint,),
+                )
+                cur.execute(
+                    """
+                    SELECT payload
+                    FROM remo_jobs
+                    WHERE payload->>'job_type' = 'ace_step_create'
+                      AND payload->>'request_fingerprint' = %s
+                      AND payload->>'status' IN ('queued', 'processing')
+                      AND updated_at > NOW() - (%s * INTERVAL '1 second')
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (fingerprint, stale_after_seconds),
+                )
+                row = cur.fetchone()
+                if row:
+                    existing = row["payload"]
+                    existing = json.loads(existing) if isinstance(existing, str) else existing
+                    conn.commit()
+                    return existing, False
+
+                cur.execute(
+                    """
+                    INSERT INTO remo_jobs(job_id, payload, created_at, updated_at)
+                    VALUES (%s, %s::jsonb, NOW(), NOW())
+                    ON CONFLICT (job_id)
+                    DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+                    """,
+                    (job["job_id"], payload),
+                )
+            conn.commit()
+
+        return job, True
+
     def load_job(self, job_id: str) -> Optional[dict]:
         if not self.enabled:
             return None
