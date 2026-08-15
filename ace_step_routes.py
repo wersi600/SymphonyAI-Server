@@ -85,6 +85,7 @@ def _generation_fingerprint(
     duration,
     seed: int,
     bpm: int,
+    diagnostic_profile: str,
 ) -> str:
     """Stable idempotency key for one logical music-generation request."""
     canonical = {
@@ -95,6 +96,7 @@ def _generation_fingerprint(
         "duration": None if duration is None else float(duration),
         "seed": int(seed),
         "bpm": int(bpm),
+        "diagnostic_profile": str(diagnostic_profile or "remo_protected"),
     }
     raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -132,6 +134,7 @@ def _submit_worker(job: dict) -> dict:
             "duration": job["duration_seconds"],
             "seed": job.get("seed", -1),
             "bpm": job.get("bpm", 0),
+            "diagnostic_profile": job.get("diagnostic_profile", "remo_protected"),
         },
         timeout=(30, 180),
     )
@@ -213,6 +216,9 @@ def _finish_from_worker(job: dict, worker: dict) -> dict:
         duration_ms=int(worker.get("duration_ms") or float(worker.get("duration") or 0) * 1000),
         sample_rate=int(worker.get("sample_rate") or 0),
         generation_seconds=float(worker.get("generation_seconds") or 0),
+        diagnostic_profile=str(worker.get("diagnostic_profile") or job.get("diagnostic_profile") or ""),
+        audio_code_count=int(worker.get("audio_code_count") or 0),
+        invalid_audio_code_count=int(worker.get("invalid_audio_code_count") or 0),
         ace_worker_result=worker,
     )
     return _save(job)
@@ -295,6 +301,11 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
 
     seed = int(payload.get("seed", -1) or -1)
     bpm = int(payload.get("bpm", 0) or 0)
+    diagnostic_profile = str(
+        payload.get("diagnostic_profile") or "remo_protected"
+    ).strip().lower()
+    if diagnostic_profile not in {"remo_protected", "official_default"}:
+        return {"status": "failed", "message": "지원하지 않는 진단 프로필입니다."}
     request_fingerprint = _generation_fingerprint(
         title=title,
         lyrics=lyrics,
@@ -302,6 +313,7 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
         duration=requested_duration,
         seed=seed,
         bpm=bpm,
+        diagnostic_profile=diagnostic_profile,
     )
 
     job_id = str(uuid.uuid4())
@@ -319,6 +331,7 @@ def create_song(background_tasks: BackgroundTasks, payload: dict = Body(...)):
         "duration_seconds": requested_duration,
         "seed": seed,
         "bpm": bpm,
+        "diagnostic_profile": diagnostic_profile,
         "request_fingerprint": request_fingerprint,
         "audio_url": "",
         "wav_url": "",
@@ -380,6 +393,9 @@ def generation_status(job_id: str = Query(...)):
         "duration_ms": int(job.get("duration_ms") or 0),
         "sample_rate": int(job.get("sample_rate") or 0),
         "mp3_ready": bool(job.get("mp3_ready")),
+        "diagnostic_profile": job.get("diagnostic_profile", "remo_protected"),
+        "audio_code_count": int(job.get("audio_code_count") or 0),
+        "invalid_audio_code_count": int(job.get("invalid_audio_code_count") or 0),
     }
 
 
