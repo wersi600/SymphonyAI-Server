@@ -39,6 +39,14 @@ def read_root():
     }
 
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+@app.head("/health")
+def health_check_head():
+    return
+    
 def hf_headers():
     if HF_TOKEN:
         return {"Authorization": f"Bearer {HF_TOKEN}"}
